@@ -20,7 +20,7 @@ protocol.Action = Action
 sys.modules['gga'] = types.ModuleType('gga')
 sys.modules['gga.protocol'] = protocol
 
-from agent import Agent  # noqa: E402
+from autopilot import Agent  # noqa: E402
 
 CONTROLLER = '''
 def control(frame, mem):
@@ -87,3 +87,19 @@ play(agent, 1.6, start=1.4, color=(200, 200, 200))
 assert agent.controller is None and 'the scene changed' in agent.seen, agent.seen
 
 print('ok')
+
+# 5. Parsing Gemma's replies.
+from gemma import parse  # noqa: E402
+
+assert parse('{"tool":"click","params":{"x":999,"y":0}}', 641, 481) == {'tool': 'click', 'params': {'x': 640, 'y': 0}}
+seq = parse('Sure: {"tool":"sequence","params":{"steps":[{"keys":[],"buttons":[],"x":500,"y":500,"duration_ms":0}]}}', 2000, 2000)
+assert seq['params']['steps'][0]['x'] == 1000, seq
+assert parse('```python\ndef control(frame, mem):\n    return None\n```', 1, 1) == {'controller': 'def control(frame, mem):\n    return None\n'}
+assert 'control' in parse('```python\ndef control(frame, mem):\n    return No', 1, 1)['controller']   # cut off by max tokens
+try:
+    parse('I will press space', 1, 1)
+    raise AssertionError('should fail')
+except ValueError:
+    pass
+
+print('parse ok')

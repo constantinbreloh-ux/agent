@@ -41,16 +41,22 @@ step(obs) ──► Frame in Puffer legen, Wake-Events prüfen
   (Kein Docker auf Kaggle; Sandbox nur leichtgewichtig – reicht, da nur unser eigenes Modell Code schreibt.)
 - Wake-Events: Controller-Handoff oder -Fehler, `sequence` fertig, Szenenwechsel (Pixeldiff), Timeout,
   abgelehnte Aktion (`obs.last_action`), neues Spiel.
-- Modell: Gemma 4 31B über vLLM im Hintergrund (4-bit via `compressed-tensors`, damit Startup < 15 min).
+- Modell: Gemma 4 31B (4-bit) in plain transformers wie im Starter-Notebook, lädt in ~1,5 min.
 - Budget: 32 × 10 min ≈ 5,3 h Spielzeit – passt in 9 h.
+
+## Arbeitsweise
+
+Gemma (62 GB) läuft nur auf Kaggle. Hier wird nur der modellfreie Teil getestet (`python test_agent.py`).
+`python make_notebook.py` baut aus den Repo-Dateien `gga_autopilot.ipynb`; das wird in Kaggle importiert
+(File → Import Notebook), ausgeführt, und `replies.txt` + die Ausgabe der Play-Zelle kommen zurück.
 
 ## Schritte
 
 1. **Daten + lokale Schleife**: Wettbewerbs-Dataset holen, `gga/protocol.py` lesen,
    `python -m gga.game --game off_line --agent agent.py` mit Dummy-Agent laufen lassen.
-2. ✅ **Async-Gerüst ohne LLM** (`agent.py`, Test: `python test_agent.py`): `Agent` mit Hintergrund-Thread, Frame-Puffer, Spielwechsel-Erkennung,
+2. ✅ **Async-Gerüst ohne LLM** (`autopilot.py`, Test: `python test_agent.py`): `Agent` mit Hintergrund-Thread, Frame-Puffer, Spielwechsel-Erkennung,
    Wake-Events. Fake-„LLM“, das nach 3 s eine feste Aktion liefert → prüft, dass `step()` nie blockiert.
-3. **Baseline-LLM**: Starter-Notebook-Modell anbinden, eine Aktion pro Aufruf (Messlatte auf den 4 Beispielspielen).
+3. 🧪 **Gemma-Anbindung** (`gemma.py`, Notebook: `python make_notebook.py` → `gga_autopilot.ipynb`, in Kaggle testen). Ursprünglich: **Baseline-LLM**: Starter-Notebook-Modell anbinden, eine Aktion pro Aufruf (Messlatte auf den 4 Beispielspielen).
 4. **`sequence` nutzen**: Modell darf Aktionsfolgen ausgeben.
 5. **Controller**: Modell schreibt `control()`, Ausführung pro `step()`, Ersetzen/Stoppen, Handoff.
 6. **Prompt**: Regeln aus dem Paper („Prefer sequence when it is enough“, „Test an uncertain control
