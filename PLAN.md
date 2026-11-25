@@ -48,7 +48,7 @@ step(obs) ──► Frame in Puffer legen, Wake-Events prüfen
 
 1. **Daten + lokale Schleife**: Wettbewerbs-Dataset holen, `gga/protocol.py` lesen,
    `python -m gga.game --game off_line --agent agent.py` mit Dummy-Agent laufen lassen.
-2. **Async-Gerüst ohne LLM**: `Agent` mit Hintergrund-Thread, Frame-Puffer, Spielwechsel-Erkennung,
+2. ✅ **Async-Gerüst ohne LLM** (`agent.py`, Test: `python test_agent.py`): `Agent` mit Hintergrund-Thread, Frame-Puffer, Spielwechsel-Erkennung,
    Wake-Events. Fake-„LLM“, das nach 3 s eine feste Aktion liefert → prüft, dass `step()` nie blockiert.
 3. **Baseline-LLM**: Starter-Notebook-Modell anbinden, eine Aktion pro Aufruf (Messlatte auf den 4 Beispielspielen).
 4. **`sequence` nutzen**: Modell darf Aktionsfolgen ausgeben.
