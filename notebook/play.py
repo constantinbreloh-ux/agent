@@ -4,7 +4,7 @@ from collections import Counter
 from IPython.display import HTML, Image as Frame, display
 from gga.game import Game
 
-GAME = 'asteroid_capitalist'   # asteroid_capitalist, blarglike, cavebots or off_line
+GAME = 'cavebots'             # asteroid_capitalist, blarglike, cavebots or off_line
 PLAY_SECONDS = 120             # in the competition a game runs for 10 minutes
 AGENT_VIEW = False             # False: the live game, every frame; True: only the screenshots the agent sees
 
