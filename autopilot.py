@@ -5,6 +5,7 @@ woken by events. Its decision is either one game action or a controller: Python 
 writes, which then plays every decision point (200 ms) from the screen until it hands back.
 """
 import io
+import json
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -88,6 +89,8 @@ class Agent:
         try:
             # shortcut: an endless loop in control() hangs step(); move it to a subprocess if models write those
             choice = self.controller(frame, self.controller_mem)
+            if choice is not None:   # numpy numbers -> plain ints/floats, which the game requires
+                choice = json.loads(json.dumps(choice, default=lambda o: o.item()))
         except Exception as e:
             self.controller = None
             self._wake(t, f'controller crashed: {e!r}')

@@ -28,7 +28,7 @@ def control(frame, mem):
     if mem['n'] > 5:
         mem['handoff'] = 'done dodging'
         return None
-    x = int(frame[:, :, 0].mean(axis=0).argmax())   # brightest red column
+    x = frame[:, :, 0].mean(axis=0).argmax()   # brightest red column, a numpy int as models write it
     return {"tool": "click", "params": {"x": x, "y": 10}}
 '''
 
@@ -67,7 +67,7 @@ def play(agent, seconds, start=0.0, **kw):
 agent = FakeModel([{'controller': CONTROLLER}, {'controller': 'def control(frame, mem): 1/0'}])
 actions = play(agent, 2.4)
 clicks = [a for a in actions if a.tool == 'click']
-assert len(clicks) == 5 and all(abs(a.params['x'] - 30) <= 1 for a in clicks), actions
+assert len(clicks) == 5 and all(type(a.params['x']) is int and abs(a.params['x'] - 30) <= 1 for a in clicks), actions
 assert agent.seen[:3] == ['new game', 'done dodging', 'controller crashed: ZeroDivisionError(\'division by zero\')'], agent.seen
 
 # 2. A sequence keeps the model asleep until it has played out.
