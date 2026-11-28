@@ -39,35 +39,43 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         game.stop()
         score = game.get_score()   # local runs only: the game's own counter, normalized 0..1 like the leaderboard
         replies = Agent.replies[first_reply:]
-        writes = [r for r in replies if '```python' in r[2]]
-        stuck = [(round(t), e[:60]) for t, e in agent.events if e.startswith('no progress')]
-        row = {
-            'game': name, 'metric': specs[name]['scoring']['metric'], 'score': score,
-            'skip share': round(tools_used['skip'] / max(turns, 1), 2), 'refused': len(refused), 'refusals': refused[:3],
-            'step max ms': round(max(step_s) * 1000),
-            'replies': len(replies), 'reply s median': round(statistics.median(r[3] for r in replies), 1) if replies else None,
-            'tokens median': statistics.median(r[4] for r in replies) if replies else None,
-            'controller writes/min': round(len(writes) / (PLAY_SECONDS / 60), 1),
-            'attempts': len(agent.attempts) + 1, 'attempt s': [round(a) for a in agent.attempts],
-            'restart → controller s': agent.restart_delays, 'no-progress wakes': stuck,
-            'library (id, what, status, signals/min, read progress/min)': [
-                (e['id'], e['desc'][:40], e['status'], round(agent.rate(e, obs.elapsed_s)), round(agent.gain(e)))
-                for e in agent.library],
-            'variants': dict(agent.variants), 'display box': agent.memory.get('display_box'),
-            'display ticks like a clock': agent.ticking,
-            'probes': agent.memory.get('probes'), 'note': agent.memory.get('note'),
-            'lessons': agent.memory.get('lessons'), 'actions': dict(tools_used),
-        }
-        sheet.append(row)
-        print(json.dumps(row, indent=1, ensure_ascii=False))
-        print('Events:', [(round(t, 1), e[:100]) for t, e in agent.events])
-        log.write(f'##### {name}\n')
+        log.write(f'##### {name}\n')   # written first: an error in the measurements below must not lose it
         for elapsed, event, reply, secs, tokens in replies:
             log.write(f'=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens)\n{reply}\n\n')
+        log.flush()
+        print('Events:', [(round(t, 1), e[:100]) for t, e in agent.events])
+        try:
+            writes = [r for r in replies if '```python' in r[2]]
+            stuck = [(round(t), e[:60]) for t, e in agent.events if e.startswith('no progress')]
+            row = {
+                'game': name, 'metric': specs[name]['scoring']['metric'], 'score': score,
+                'skip share': round(tools_used['skip'] / max(turns, 1), 2), 'refused': len(refused), 'refusals': refused[:3],
+                'step max ms': round(max(step_s) * 1000),
+                'replies': len(replies), 'reply s median': round(statistics.median(r[3] for r in replies), 1) if replies else None,
+                'tokens median': statistics.median(r[4] for r in replies) if replies else None,
+                'controller writes/min': round(len(writes) / (PLAY_SECONDS / 60), 1),
+                'attempts': len(agent.attempts) + 1, 'attempt s': [round(a) for a in agent.attempts],
+                'restart → controller s': agent.restart_delays, 'no-progress wakes': stuck,
+                'library (id, what, status, signals/min, read progress/min)': [
+                    (e['id'], e['desc'][:40], e['status'], round(agent.rate(e, obs.elapsed_s)), round(agent.gain(e)))
+                    for e in agent.library],
+                'variants': dict(agent.variants), 'display box': agent.memory.get('display_box'),
+                'display ticks like a clock': agent.ticking,
+                'probes': agent.memory.get('probes'), 'note': agent.memory.get('note'),
+                'lessons': agent.memory.get('lessons'), 'actions': dict(tools_used),
+            }
+        except Exception as e:   # one game's measurements failing must not end the run
+            import traceback
+            row = {'game': name, 'error': traceback.format_exc()}
+        sheet.append(row)
+        print(json.dumps(row, indent=1, ensure_ascii=False, default=str))
     log.close()
     json.dump(sheet, open('/kaggle/working/sheet.json', 'w'), indent=1, ensure_ascii=False, default=str)
     print('\nMeasurement sheet')
     for row in sheet:
+        if 'error' in row:
+            print(f"{row['game']:20} measurement error: {row['error'][-300:]}")
+            continue
         print(f"{row['game']:20} score {row['score']}  skip {row['skip share']}  refused {row['refused']}  "
               f"reply {row['reply s median']} s / {row['tokens median']} tok  writes/min {row['controller writes/min']}  "
               f"attempts {row['attempts']} {row['attempt s']}  no-progress {len(row['no-progress wakes'])}  "

@@ -200,7 +200,7 @@ agent.step(obs(0.0), [])   # the first step starts the game and resets memory
 agent.memory['display_box'] = (0, 0, 999, 999)
 for i in range(1, 14):
     agent.step(obs(float(i), red_x=5 + 4 * i % 50, color=(0, 0, 0) if i % 2 else (90, 90, 90)), [])
-assert agent.ticking and 'like a clock' in agent.memory['signals'], agent.memory['signals']
+assert agent.ticking is True and 'like a clock' in agent.memory['signals'], agent.memory['signals']   # a plain bool: json needs it
 print('ticking ok')
 
 # 10. No progress: a static screen and repeated actions wake the model with the measurements.

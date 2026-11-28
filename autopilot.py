@@ -347,9 +347,9 @@ class Agent:
             px = to_pixels({'x': box[0], 'y': box[1], 'x2': box[2], 'y2': box[3]}, *image.size)
             crop = np.asarray(image.convert('L').crop((px['x'], px['y'], px['x2'] + 1, px['y2'] + 1))
                               .resize((32, 8)), np.float32)
-            changed = self.box is not None and np.abs(crop - self.box).mean() > DISPLAY_DIFF
+            changed = bool(self.box is not None and np.abs(crop - self.box).mean() > DISPLAY_DIFF)
             self.display_ticks.append(changed)
-            self.ticking = sum(self.display_ticks) >= TICKING   # a clock or timer, not progress
+            self.ticking = bool(sum(self.display_ticks) >= TICKING)   # a clock or timer, not progress
             if changed and not self.ticking:
                 self.display_t, progress = t, True
             self.box = crop
