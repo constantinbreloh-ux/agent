@@ -50,8 +50,11 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
             'controller writes/min': round(len(writes) / (PLAY_SECONDS / 60), 1),
             'attempts': len(agent.attempts) + 1, 'attempt s': [round(a) for a in agent.attempts],
             'restart → controller s': agent.restart_delays, 'no-progress wakes': stuck,
-            'library': [(e['id'], e['desc'][:40], e['status'], round(agent.rate(e, obs.elapsed_s)))
-                        for e in agent.library],
+            'library (id, what, status, signals/min, read progress/min)': [
+                (e['id'], e['desc'][:40], e['status'], round(agent.rate(e, obs.elapsed_s)), round(agent.gain(e)))
+                for e in agent.library],
+            'variants': dict(agent.variants), 'display box': agent.memory.get('display_box'),
+            'display ticks like a clock': agent.ticking,
             'probes': agent.memory.get('probes'), 'note': agent.memory.get('note'),
             'lessons': agent.memory.get('lessons'), 'actions': dict(tools_used),
         }
@@ -67,4 +70,5 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
     for row in sheet:
         print(f"{row['game']:20} score {row['score']}  skip {row['skip share']}  refused {row['refused']}  "
               f"reply {row['reply s median']} s / {row['tokens median']} tok  writes/min {row['controller writes/min']}  "
-              f"attempts {row['attempts']}  no-progress {len(row['no-progress wakes'])}  restart {row['restart → controller s']}")
+              f"attempts {row['attempts']} {row['attempt s']}  no-progress {len(row['no-progress wakes'])}  "
+              f"restart {row['restart → controller s']}  variants {row['variants']}  clock {row['display ticks like a clock']}")

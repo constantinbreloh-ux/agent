@@ -5,10 +5,12 @@ events. Its decision is one game action, a controller (Python code it writes, wh
 decision point from the screen), a control check, KEEP or REUSE of a stored controller.
 
 Without the model, about once a second, the agent measures image signals: new screen content, changes in
-the progress display the model located, repeated actions, screens seen before (game over), and wakes the
-model when nothing moves for STUCK_S. Every controller is kept per game in a library with its results;
-after a game over the agent replays the actions that left that screen and restarts the best controller of
-the next screen at once, and it tries model-written variants of a working controller in parallel.
+the progress display the model located (unless it ticks like a clock), repeated actions, and wakes the
+model when nothing moves for STUCK_S. Screens are told apart: a play screen is one a controller played on
+or the agent stayed on for PLAY_S; leaving one ends an attempt (game over or next level). Menu screens
+remember the actions that led off them, and the agent replays those when the screen shows again. Every
+controller is kept per game in a library with its results; when a play screen shows again its best
+controller restarts at once, and model-written variants of a working controller are tried in parallel.
 """
 import io
 import json
@@ -33,6 +35,8 @@ REPLAY_GAP_S = 0.6         # between replayed restart actions
 VARY_AFTER_S = 20          # a controller running this long gets a variant tried
 TRIAL_S = 15               # how long a variant plays before it is compared with its parent
 BEST_MIN_S = 5             # a controller must have played this long to be restarted as the best
+PLAY_S = 20                # a screen the agent stays on this long is a play screen, not a menu
+TICKING = 8                # a display that changed in this many of the last 10 seconds is a clock
 XY = {'x', 'y', 'x2', 'y2'}
 GRID = 1000                # the model's coordinates: 0-999 over the screen, in actions and controllers alike
 
@@ -88,6 +92,9 @@ class Agent:
         self.scenes = deque()
         self.scene_t = -SCENE_COOLDOWN_S
         self.scene_thumbs, self.scene_id, self.scene_actions, self.exits = [], None, [], {}
+        self.play_scenes, self.scene_entered_t = set(), 0.0
+        self.display_ticks, self.ticking = deque(maxlen=10), False
+        self.variants = Counter()           # variant trials: kept / dropped
         self.signal_t, self.seen_thumbs, self.box = -1, np.zeros((0, 256), np.float32), None
         self.novel_t = self.display_t = self.stuck_t = self.attempt_t = 0.0
         self.recent = deque(maxlen=10)      # the model's last actions, as (tool, key) patterns
@@ -115,10 +122,13 @@ class Agent:
         action = None
         if self.future and self.future.done():
             future, self.future = self.future, None
-            try:
-                action = self._apply(future.result(), t, image)
-            except Exception as e:   # bad model reply: tell the model on its next call
-                self._wake(t, f'your last reply failed: {e!r}')
+            if self.future_scene != self.scene_id:   # decided for an earlier screen, e.g. Retry once play is back
+                self.events.append((t, f'dropped a reply decided on screen #{self.future_scene}'))
+            else:
+                try:
+                    action = self._apply(future.result(), t, image)
+                except Exception as e:   # bad model reply: tell the model on its next call
+                    self._wake(t, f'your last reply failed: {e!r}')
         if self.variant and self.variant.done():
             future, self.variant = self.variant, None
             try:
@@ -177,8 +187,7 @@ class Agent:
         self.probes, self.queue = [], []
         action = Action(decision['tool'], decision.get('params') or {})
         self.recent.append((action.tool, str(action.params.get('key') or action.params.get('keys') or '')))
-        if self.future_scene == self.scene_id:   # decided on an earlier screen: it did not lead off this one
-            self.scene_actions.append(action)
+        self.scene_actions.append(action)
         return action
 
     # --- controllers and their library ---
@@ -187,7 +196,7 @@ class Agent:
         first = code.strip().splitlines()[0] if code.strip() else ''
         entry = {'id': len(self.library) + 1, 'scene': self.scene_id, 'code': code, 'parent': parent,
                  'desc': first.lstrip('#').replace('skill:', '').strip() if first.startswith('#') else first[:60],
-                 'runtime': 0.0, 'events': 0, 'status': 'new', 'reason': ''}
+                 'runtime': 0.0, 'events': 0, 'signal_t': [], 'readings': [], 'status': 'new', 'reason': ''}
         self.library.append(entry)
         namespace = {'np': np}
         try:
@@ -205,15 +214,22 @@ class Agent:
         """Progress signals (new screen content, display changes) per minute while it played."""
         return entry['events'] * 60 / max(self.runtime(entry, t), 1)
 
+    @staticmethod
+    def gain(entry):
+        """Per minute, how the progress number the model read changed while it played (0 without two readings)."""
+        (t0, v0), (t1, v1) = (entry['readings'][0], entry['readings'][-1]) if len(entry['readings']) > 1 else ((0, 0), (1, 0))
+        return (v1 - v0) * 60 / max(t1 - t0, 1)
+
     def _best(self, scene, t):
-        good = [e for e in self.library if e['scene'] == scene and e['status'] == 'ok' and e['events']
-                and self.runtime(e, t) >= BEST_MIN_S]
-        return max(good, key=lambda e: self.rate(e, t), default=None)
+        good = [e for e in self.library if e['scene'] == scene and e['status'] == 'ok'
+                and (e['events'] or len(e['readings']) > 1) and self.runtime(e, t) >= BEST_MIN_S]
+        return max(good, key=lambda e: (self.gain(e), self.rate(e, t)), default=None)
 
     def _start(self, entry, t):
         if self.entry is not entry:
             self._stop(t, 'ok', f"replaced by #{entry['id']}")
         self.controller, self.entry, self.controller_mem = entry['fn'], entry, {}
+        self.play_scenes.add(self.scene_id)
         self.controller_start = self.controller_t = entry['since'] = t
         entry['status'], self.probes, self.queue = 'running', [], []
 
@@ -265,7 +281,7 @@ class Agent:
         entry = self._new_entry(code, t, parent=parent['id'])
         self._start(entry, t)
         parent['status'] = 'ok'   # paused, not failed
-        self.trial = {'entry': entry, 'parent': parent, 'end': t + TRIAL_S}
+        self.trial = {'entry': entry, 'parent': parent, 'start': t, 'end': t + TRIAL_S}
         self.events.append((t, f"trying variant #{entry['id']} of #{parent['id']}"))
         return self._run_controller(t, image)
 
@@ -274,10 +290,17 @@ class Agent:
         variant, parent = trial['entry'], trial['parent']
         if self.entry is not variant:   # it was stopped or replaced meanwhile
             return None
-        if variant['events'] and self.rate(variant, t) > 1.2 * self.rate(parent, t):
-            self.events.append((t, f"variant #{variant['id']} beats #{parent['id']}: kept"))
+        # the parent's last TRIAL_S before the trial against the variant's TRIAL_S: new screen content gets
+        # rarer as a game goes on, so a lifetime average would favour the parent
+        start = trial['start']
+        ours = sum(s >= start for s in variant['signal_t'])
+        theirs = sum(start - TRIAL_S <= s < start for s in parent['signal_t'])
+        if ours and ours > 1.2 * theirs:
+            self.variants['kept'] += 1
+            self.events.append((t, f"variant #{variant['id']} beats #{parent['id']} ({ours} vs {theirs} signals): kept"))
             return None
-        self._stop(t, f"worse than #{parent['id']}", f'{self.rate(variant, t):.0f} vs {self.rate(parent, t):.0f} progress/min')
+        self.variants['dropped'] += 1
+        self._stop(t, f"worse than #{parent['id']}", f'{ours} vs {theirs} progress signals in {TRIAL_S} s')
         self.events.append((t, f"variant #{variant['id']} is not better than #{parent['id']}: back to #{parent['id']}"))
         self._start(parent, t)
         return self._run_controller(t, image)
@@ -324,20 +347,25 @@ class Agent:
             px = to_pixels({'x': box[0], 'y': box[1], 'x2': box[2], 'y2': box[3]}, *image.size)
             crop = np.asarray(image.convert('L').crop((px['x'], px['y'], px['x2'] + 1, px['y2'] + 1))
                               .resize((32, 8)), np.float32)
-            if self.box is not None and np.abs(crop - self.box).mean() > DISPLAY_DIFF:
+            changed = self.box is not None and np.abs(crop - self.box).mean() > DISPLAY_DIFF
+            self.display_ticks.append(changed)
+            self.ticking = sum(self.display_ticks) >= TICKING   # a clock or timer, not progress
+            if changed and not self.ticking:
                 self.display_t, progress = t, True
             self.box = crop
         if progress and self.entry:
             self.entry['events'] += 1
+            self.entry['signal_t'].append(t)
         pattern, count = Counter(self.recent).most_common(1)[0] if self.recent else (None, 0)
         repeating = count >= 8
         self.memory['signals'] = (
             f'new screen content {t - self.novel_t:.0f} s ago; '
-            + (f'progress display changed {t - self.display_t:.0f} s ago; ' if box else 'no progress display located; ')
+            + ('the progress display changes every second like a clock, not counted; ' if box and self.ticking
+               else f'progress display changed {t - self.display_t:.0f} s ago; ' if box else 'no progress display located; ')
             + (f'{count} of your last 10 actions were {pattern[0]} {pattern[1]}; ' if repeating else '')
             + f'attempt {len(self.attempts) + 1}, running {t - self.attempt_t:.0f} s'
             + (', earlier attempts lasted ' + ', '.join(f'{a:.0f} s' for a in self.attempts[-5:]) if self.attempts else ''))
-        quiet = t - self.novel_t >= STUCK_S and (repeating or not box or t - self.display_t >= STUCK_S)
+        quiet = t - self.novel_t >= STUCK_S and (repeating or not box or self.ticking or t - self.display_t >= STUCK_S)
         if quiet and t - self.stuck_t >= STUCK_S and not self.probes:
             self.stuck_t = t
             if self.entry:
@@ -373,21 +401,27 @@ class Agent:
     def _new_scene(self, t, image):
         old = self.scene_id
         new, known = self._scene_of(thumb(image))
-        if self.scene_actions:            # what the model did on the old screen led off it: keep it for replays
+        if new == old:
+            return
+        played = old in self.play_scenes or t - self.scene_entered_t >= PLAY_S
+        if played:
+            self.play_scenes.add(old)
+        elif self.scene_actions:          # a menu our actions led off: replay them when it shows again
             self.exits[old] = self.scene_actions[-4:]
-            self.scene_actions = []
-        if old in self.exits:             # left a menu / game-over screen: a new attempt starts
-            self.attempt_t = t
+        self.scene_actions = []
         self._stop(t, 'ok', 'the scene changed')
-        self.scene_id = new
-        if new in self.exits and new != old:   # back on a screen left before: game over (or menu)
-            if self.attempt_t:
-                self.attempts.append(t - self.attempt_t)
+        self.queue = []                   # a replay that worked stops here, before it clicks into the next screen
+        self.scene_id, self.scene_entered_t = new, t
+        ended = t - self.attempt_t        # measured before the next attempt's clock starts
+        self.attempt_t = t
+        if played:                        # a play screen gave way: the attempt ended (game over or next level)
+            self.attempts.append(ended)
             self.restart_t = t
-            self.queue, self.queue_t = list(self.exits[new]), t + REPLAY_GAP_S
-            self._wake(t, f'game over: back on screen #{new} after {self.attempts[-1] if self.attempts else t:.0f} s; '
-                          f'replaying the {len(self.queue)} actions that left it last time. '
-                          'What killed you or ended the run? What do you change?')
+            self.queue, self.queue_t = list(self.exits.get(new, [])), t + REPLAY_GAP_S
+            self._wake(t, f'game over or next level: play screen #{old} gave way to screen #{new} after {ended:.0f} s'
+                          + (f'; replaying the {len(self.queue)} actions that led off this screen last time'
+                             if self.queue else '')
+                          + '. If the run ended: what ended it, and what do you change?')
             return
         best = self._best(new, t)
         if best:

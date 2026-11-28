@@ -173,8 +173,10 @@ class Agent(AutoPilot):
         lines = []
         for e in memory['library']:
             if e['status'] in ('ok', 'running') or e['status'].startswith('worse'):
+                read = e['readings']
                 lines.append(f"#{e['id']} [screen {e['scene']}] {e['desc']}: played {self.runtime(e, t):.0f} s, "
-                             f"{self.rate(e, t):.0f} progress signals/min, {e['status']}")
+                             + (f"progress you read {read[0][1]:g} -> {read[-1][1]:g}, " if len(read) > 1 else '')
+                             + f"{self.rate(e, t):.0f} progress signals/min, {e['status']}")
             else:
                 lines.append(f"#{e['id']} {e['desc']}: FAILED ({e['status']}: {e['reason'][:100]})")
         return '\n'.join(lines[-12:]) or 'empty'
@@ -227,6 +229,9 @@ class Agent(AutoPilot):
         before = [jpeg for _, jpeg in list(memory['last_frames'])[-6:-1]] if game_over else []
         reply = self.ask(obs, event, RULES, text, 768, before)
         log.append(f'[{event[:60]}] ' + ' '.join(reply.split())[:300])
+        number = re.search(r'^\s*Progress:\D*?(-?\d[\d,]*\.?\d*)', reply, re.M)
+        if number and self.controller and self.entry:   # the number it read, to compare controllers by
+            self.entry['readings'].append((t, float(number.group(1).replace(',', ''))))
         for key, store in (('Progress', progress), ('Lesson', lessons), ('Note', memory.setdefault('fixes', []))):
             found = re.search(rf'^\s*{key}:\s*(.+)$', reply, re.M)
             if found:

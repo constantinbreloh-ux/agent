@@ -88,11 +88,11 @@ agent.memory['note'] = 'old game'
 play(agent, 0.4, start=0.0)
 assert 'note' not in agent.memory and agent.library == [] and agent.seen[-1] == 'new game', (agent.memory, agent.seen)
 
-# 4. A lasting scene change stops the controller and wakes the model.
+# 4. A lasting scene change stops the controller and wakes the model; a controller played there, so it ended an attempt.
 agent = FakeModel([{'controller': 'def control(frame, mem): return {"tool": "skip"}'}])
 play(agent, 1.4)
 play(agent, 1.6, start=1.4, color=(200, 200, 200))
-assert agent.controller is None and any(e.startswith('the scene changed (screen #1, new)') for e in agent.seen), agent.seen
+assert agent.controller is None and any(e.startswith('game over or next level: play screen #0 gave way to screen #1') for e in agent.seen), agent.seen
 
 print('ok')
 
@@ -158,25 +158,50 @@ print('check-in ok')
 assert gemma.parse('{"tool":"drag","params":{"x":0,"y":0,"x2":999,"y2":999}}', 641, 481)['params'] == {'x': 0, 'y': 0, 'x2': 640, 'y2': 480}
 print('drag ok')
 
-# 9. Game over: back on a screen left before -> replay the actions that left it, then restart the best controller.
+# 9. Menu -> (action) -> play -> (action) -> game over -> (action) -> play: one game over, an attempt longer
+#    than 0 s, and on the way back into play the best controller restarts without the model.
 autopilot.BEST_MIN_S = 0.5
+MENU, PLAY, OVER = (0, 0, 0), (200, 200, 200), (0, 0, 220)
 MOVE = '# skill: hold the pointer mid-screen\ndef control(frame, mem): return {"tool": "move", "params": {"x": 500, "y": 500}}'
 def policy(agent, event):
-    if agent.scene_id == 0:
-        return {'tool': 'click', 'params': {'x': 3, 'y': 3}}
-    return {'keep': True} if agent.library else {'controller': MOVE}
+    if agent.scene_id == 1:   # play: one action of its own, then a controller; later KEEP
+        if not getattr(agent, 'acted', False):
+            agent.acted = True
+            return {'tool': 'press_key', 'params': {'key': 'a'}}
+        return {'keep': True} if agent.library else {'controller': MOVE}
+    return {'tool': 'click', 'params': {'x': 3 + agent.scene_id, 'y': 3}}   # menu and game over: a button
 agent = FakeModel(policy)
-play(agent, 1.6)
-play(agent, 2.8, start=1.6, color=(200, 200, 200))
-assert agent.entry and agent.entry['desc'] == 'hold the pointer mid-screen', agent.events
+play(agent, 1.6, color=MENU)
+play(agent, 3.4, start=1.6, color=PLAY)
+assert agent.entry and agent.entry['desc'] == 'hold the pointer mid-screen' and 1 in agent.play_scenes, agent.events
 agent.library[0]['events'] = 3   # stand-in for progress signals while it played
-actions = play(agent, 2.2, start=4.4)
-assert any(e.startswith('game over: back on screen #0') for _, e in agent.events), agent.events
-assert agent.attempts and agent.library[0]['status'] == 'ok', (agent.attempts, agent.library)
-play(agent, 2.0, start=6.6, color=(200, 200, 200))
+play(agent, 2.0, start=5.0, color=OVER)
+play(agent, 2.0, start=7.0, color=PLAY)
+overs = [e for _, e in agent.events if e.startswith('game over')]
+assert len(overs) == 1 and 'play screen #1 gave way to screen #2' in overs[0], agent.events
+assert len(agent.attempts) == 1 and agent.attempts[0] > 2, agent.attempts
+assert 1 not in agent.exits and 0 in agent.exits and 2 in agent.exits, agent.exits   # only menus have exits
 assert any('your best controller for it, #1, is playing again' in e for _, e in agent.events), agent.events
 assert agent.entry is agent.library[0] and agent.restart_delays, (agent.entry, agent.restart_delays)
 print('game over ok')
+
+# 9b. A second death replays the button that led off the game-over screen.
+agent.library[0]['events'] = 3
+play(agent, 1.6, start=9.0, color=OVER)
+play(agent, 1.6, start=10.6, color=PLAY)
+assert agent.queue == [] and agent.scene_id == 1, agent.queue   # the replay stopped once play was back
+overs = [e for _, e in agent.events if e.startswith('game over')]
+assert len(overs) == 2 and 'replaying the 4 actions that led off this screen' in overs[1], overs   # up to the last 4
+print('replay ok')
+
+# 9c. A display that changes every second is a clock: not progress.
+agent = FakeModel(lambda agent, event: {'tool': 'wait', 'params': {'duration_ms': 100}})
+agent.step(obs(0.0), [])   # the first step starts the game and resets memory
+agent.memory['display_box'] = (0, 0, 999, 999)
+for i in range(1, 14):
+    agent.step(obs(float(i), red_x=5 + 4 * i % 50, color=(0, 0, 0) if i % 2 else (90, 90, 90)), [])
+assert agent.ticking and 'like a clock' in agent.memory['signals'], agent.memory['signals']
+print('ticking ok')
 
 # 10. No progress: a static screen and repeated actions wake the model with the measurements.
 autopilot.STUCK_S = 2
@@ -203,6 +228,7 @@ play(agent, 2.6)
 texts = [e for _, e in agent.events]
 assert 'trying variant #2 of #1' in texts and 'variant #2 is not better than #1: back to #1' in texts, texts
 assert agent.entry is agent.library[0] and agent.library[1]['status'] == 'worse than #1', agent.library
+assert agent.variants == {'dropped': 1}, agent.variants
 autopilot.VARY_AFTER_S, autopilot.TRIAL_S = 20, 15
 print('variant ok')
 
@@ -230,4 +256,8 @@ assert [c['type'] for c in content] == ['image_url'] * 6 + ['text'] and 'last se
 o.elapsed_s = 25.0
 agent.think(o, 'ready', agent.memory)   # 20 s: the note is revised, a control check planned
 assert agent.memory['note_at_20s'] and agent.memory['probed'], agent.memory.keys()
+agent.controller, agent.controller_start = True, 20.0
+agent.entry = {'id': 1, 'code': 'def control(frame, mem): pass\n', 'readings': []}
+gemma.chat = lambda messages, max_tokens: ('Progress: score 1,250\nKEEP', 5)
+assert agent.think(o, 'check-in', agent.memory) == {'keep': True} and agent.entry['readings'] == [(25.0, 1250.0)]
 print('gemma ok')
