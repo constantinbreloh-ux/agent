@@ -24,6 +24,8 @@ reading = ThreadPoolExecutor(16).map(lambda offset: os.pread(fd, 64 * 2**20, off
                                      range(0, os.fstat(fd).st_size, 64 * 2**20))
 subprocess.run(f'pip install -q --no-index --find-links {wheels} --find-links {kit}/wheels vllm playwright',
                shell=True, check=True)
+# vLLM brings torch for CUDA 13; the image's torchaudio (CUDA 12.8) then fails on import. Gemma needs no audio.
+subprocess.run('pip uninstall -q -y torchaudio', shell=True, check=True)
 log('installed vLLM and Playwright')
 subprocess.Popen(['Xvfb', ':99', '-screen', '0', '1920x1080x24'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 sys.path.insert(0, str(harness))
