@@ -111,3 +111,27 @@ except ValueError:
     pass
 
 print('parse ok')
+
+# 7. Gemma's request to the vLLM server, against a fake server.
+import http.server, json, threading  # noqa: E401,E402
+import gemma  # noqa: E402
+
+class FakeServer(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        FakeServer.body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        out = json.dumps({'choices': [{'message': {'content': '{"tool":"click","params":{"x":0,"y":999}}'}}],
+                          'usage': {'completion_tokens': 20}}).encode()
+        self.send_response(200), self.end_headers(), self.wfile.write(out)
+    def log_message(self, *args): pass
+
+server = http.server.HTTPServer(('127.0.0.1', 0), FakeServer)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+gemma.SERVER = f'http://127.0.0.1:{server.server_port}/v1/chat/completions'
+agent = gemma.Agent()
+o = obs(1.0)
+o.info = {'description': 'd', 'controls': 'c', 'width': 64, 'height': 48, 'remaining_s': 9}
+assert agent.think(o, 'ready', {}) == {'tool': 'click', 'params': {'x': 0, 'y': 47}}
+user = FakeServer.body['messages'][1]['content']
+assert user[0]['image_url']['url'].startswith('data:image/jpeg;base64,') and 'ready' in user[1]['text'], user
+assert agent.replies[-1][4] == 20
+print('vllm request ok')

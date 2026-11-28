@@ -41,7 +41,7 @@ step(obs) ──► Frame in Puffer legen, Wake-Events prüfen
   (Kein Docker auf Kaggle; Sandbox nur leichtgewichtig – reicht, da nur unser eigenes Modell Code schreibt.)
 - Wake-Events: Controller-Handoff oder -Fehler, `sequence` fertig, Szenenwechsel (Pixeldiff), Timeout,
   abgelehnte Aktion (`obs.last_action`), neues Spiel.
-- Modell: Gemma 4 31B (4-bit) in plain transformers wie im Starter-Notebook, lädt in ~1,5 min.
+- Modell: Gemma 4 31B (4-bit) im vLLM-Server (0.34.0, Wheels aus dem Notebook `gga-vllm-wheels`). Plain transformers schaffte nur 18–23 Tokens/s.
 - Budget: 32 × 10 min ≈ 5,3 h Spielzeit – passt in 9 h.
 
 ## Arbeitsweise

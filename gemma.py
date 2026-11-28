@@ -1,13 +1,16 @@
-# Notebook cell: Gemma as the model behind autopilot.Agent.
-# `processor` and `model` come from the setup cell; they are only used inside think().
+# Notebook cell: Gemma, served by vLLM on localhost (setup cell), as the model behind autopilot.Agent.
+import base64
 import io
 import time
+import urllib.request
 import json
 import re
 
 from PIL import Image
 
 from autopilot import Agent as AutoPilot
+
+SERVER = 'http://localhost:8000/v1/chat/completions'
 
 RULES = '''You play a real-time browser game from screenshots. The game keeps running while you think, and each
 of your replies takes seconds, so prefer moves that keep playing on their own.
@@ -64,6 +67,15 @@ def parse(reply, width, height):
     return {'tool': choice['tool'], 'params': to_pixels(choice.get('params', {}), width, height)}
 
 
+def chat(messages, max_tokens):
+    """One reply from the vLLM server: (text, tokens generated)."""
+    body = json.dumps({'model': 'gemma', 'messages': messages, 'max_tokens': max_tokens, 'temperature': 0}).encode()
+    request = urllib.request.Request(SERVER, body, {'Content-Type': 'application/json'})
+    with urllib.request.urlopen(request, timeout=85) as response:
+        out = json.load(response)
+    return out['choices'][0]['message']['content'], out['usage']['completion_tokens']
+
+
 class Agent(AutoPilot):
     replies = []   # every reply of every game, for reading after a run
 
@@ -72,6 +84,9 @@ class Agent(AutoPilot):
         log = memory.setdefault('log', [])
         frame = Image.open(io.BytesIO(obs.image)).convert('RGB')
         frame.thumbnail((768, 768))
+        jpeg = io.BytesIO()
+        frame.save(jpeg, 'JPEG', quality=90)
+        image = 'data:image/jpeg;base64,' + base64.b64encode(jpeg.getvalue()).decode()
         text = (
             f"Brief: {info['description']} Controls: {info['controls']}\n"
             f"Screen: {info['width']}x{info['height']} pixels. Time left: {info['remaining_s']:.0f} s.\n"
@@ -80,15 +95,11 @@ class Agent(AutoPilot):
             f"Your recent replies, oldest first:\n" + ('\n'.join(log[-6:]) or 'none') + '\nYour reply:'
         )
         messages = [
-            {'role': 'system', 'content': [{'type': 'text', 'text': RULES}]},
-            {'role': 'user', 'content': [{'type': 'image'}, {'type': 'text', 'text': text}]},
+            {'role': 'system', 'content': RULES},
+            {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': image}}, {'type': 'text', 'text': text}]},
         ]
         began = time.time()
-        prompt = processor.apply_chat_template(messages, add_generation_prompt=True)  # noqa: F821
-        inputs = processor(text=prompt, images=[frame], return_tensors='pt').to(model.device)  # noqa: F821
-        out = model.generate(**inputs, max_new_tokens=768, do_sample=False, prompt_lookup_num_tokens=20)  # noqa: F821
-        reply = processor.decode(out[0, inputs['input_ids'].shape[1]:], skip_special_tokens=True)  # noqa: F821
+        reply, tokens = chat(messages, 768)
         log.append(f'[{event}] ' + ' '.join(reply.split())[:300])
-        tokens = out.shape[1] - inputs['input_ids'].shape[1]
         self.replies.append((obs.elapsed_s, event, reply, time.time() - began, tokens))
         return parse(reply, info['width'], info['height'])
