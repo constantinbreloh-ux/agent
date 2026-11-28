@@ -42,12 +42,12 @@ class FakeModel(Agent):
         self.replies, self.seen = (replies if callable(replies) else list(replies)), []
         self.write_code = self.variant_code = self.verdict = None
         self.note = self.probe_plan = None
-        self.write_s = 0.3
+        self.write_s, self.think_s = 0.3, 0.3
         super().__init__()
 
     def think(self, obs, event, view):
         self.seen.append(event)
-        time.sleep(0.3)   # a slow model
+        time.sleep(self.think_s)   # a slow model
         if callable(self.replies):
             return self.replies(self, event)
         return self.replies.pop(0) if self.replies else {'tool': 'skip', 'params': {}}
@@ -133,13 +133,16 @@ def player(agent, event):
         return {'write': 'hold the pointer mid-screen'}
     return {'tool': 'press_key', 'params': {'key': 'a'}}
 agent = FakeModel(player)
-agent.write_code, agent.write_s = MOVE, 1.2
-actions = play(agent, 3.0)
+agent.write_code, agent.write_s, agent.think_s = MOVE, 1.2, 0.8   # a reply is in flight when the controller starts
+actions = play(agent, 3.4)
 assert 'writer asked: hold the pointer mid-screen' in texts(agent), texts(agent)
 assert any(e.startswith("writer's #1") and e.endswith('started') for e in texts(agent)), texts(agent)
 assert agent.entry is agent.library[0] and agent.library[0]['goal'] == 'hold the pointer mid-screen', agent.library
 assert agent.stats['steps while writing'] > 0 and agent.stats['skips while writing'] < agent.stats['steps while writing'], agent.stats
 assert any(a.tool == 'press_key' for a in actions) and any(a.tool == 'move' for a in actions), actions   # played on
+# the player's reply in flight when the controller started is from an older decision count: dropped, not played
+assert agent.stats['player replies dropped'] >= 1 and agent.entry['status'] == 'running', (agent.stats, texts(agent))
+assert actions[-1].tool == 'move', actions[-3:]   # the controller still plays at the end
 print('writer ok')
 
 # 6b. A controller finished after its screen went away is stored, not started.
@@ -232,12 +235,29 @@ for i, color in enumerate([(0, 0, 0)] * 2 + [(200, 200, 200)] * 3 + [(0, 0, 0)])
 assert agent.novel_t == 5.0, agent.novel_t   # black again after 3 s away: new within the window
 autopilot.NOVEL_WINDOW_S = 30
 
+# 10a. Calibrated on the run videos: a thin moving line is new content, the same screen is not.
+agent = Agent()
+for i in range(4):
+    agent.step(obs(float(i), red_x=30), [])
+assert agent.novel_t == 0.0, agent.novel_t
+agent.step(obs(4.0, red_x=10), [])
+assert agent.novel_t == 4.0, agent.novel_t
+
 # 10b. No progress: a static screen and repeated actions wake the player with the measurements.
 autopilot.STUCK_S = 2
 agent = FakeModel(lambda agent, event: {'tool': 'click', 'params': {'x': 3, 'y': 3}})
 play(agent, 5.0)
 stuck = [e for e in texts(agent) if e.startswith('no progress signal')]
 assert stuck and 'of your last 10 actions were click' in stuck[-1] and 'no progress display located' in stuck[-1], agent.events
+assert agent.stats['idle steps'] > 0 and agent.stats['idle steps'] < agent.stats['steps'], agent.stats
+
+# 10c. While a controller plays, no progress goes to the checker, not the player.
+agent = FakeModel([{'controller': MOVE}])
+agent.verdict = {'verdict': 'KEEP', 'reason': 'fine', 'reading': None}
+play(agent, 5.0)
+assert 'no progress signal for #1: the checker looks now' in texts(agent), texts(agent)
+assert not any(e.startswith('no progress signal:') for e in agent.seen), agent.seen
+assert any(e.startswith('checker on #1: KEEP') for e in texts(agent)) and agent.entry is agent.library[0], texts(agent)
 autopilot.STUCK_S = 15
 print('signals ok')
 

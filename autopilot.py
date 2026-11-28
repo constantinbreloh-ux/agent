@@ -13,7 +13,9 @@ At most MAX_BACKGROUND background calls run at once; the player runs beside them
 
 Without a model, about once a second, the conductor measures image signals: new screen content against
 the last NOVEL_WINDOW_S, changes in the progress display the analyst located (unless it ticks like a
-clock), repeated actions; nothing for STUCK_S wakes the player. A play screen is one a controller played
+clock), repeated actions. Nothing for STUCK_S makes the checker look at a running controller, or else
+wakes the player. A decision counter rises with every change of situation (a controller starts, the scene
+changes, a control check or a replay starts); a player reply from an older count is dropped. A play screen is one a controller played
 on or the agent stayed on for PLAY_S; leaving one ends an attempt. Menus remember the actions that led off
 them and the conductor replays them; a play screen that shows again restarts its best controller.
 """
@@ -32,7 +34,9 @@ CONTROLLER_MAX_S = 0.1     # a controller call slower than this is switched off
 SCENE_DIFF = 0.5           # share of pixels that must differ from ~1 s ago for a scene change
 SCENE_COOLDOWN_S = 2
 SCENE_MATCH = 12           # mean abs difference of 16x16 gray thumbnails under which two screens are one scene
-NOVEL_DIFF = 10            # ... over which a screen counts as new content
+NOVEL_SIZE = 64            # new screen content: 64x64 gray previews, measured on the 8 videos of runs 10 and 11
+NOVEL_PIXEL = 20           # a preview pixel changed if its gray value moved more than this
+NOVEL_SHARE = 0.005        # new if at least this share of pixels differs from every screen of the window
 NOVEL_WINDOW_S = 30        # new against the screens of the last this many seconds, not the whole game
 DISPLAY_DIFF = 6           # mean abs change in the progress display box that counts as the display changing
 STUCK_S = 15               # no progress signal this long: wake the player
@@ -128,6 +132,7 @@ class Agent:
         self.restart_t, self.restart_delays = None, []
         self.variants, self.verdicts, self.stats = Counter(), Counter(), Counter()
         self.first_scene_t = self.first_play_delay = None
+        self.epoch = 0                        # the decision counter
 
     def _view(self, t, **extra):
         """A snapshot for a model role: copies, so threads never see memory change under them."""
@@ -180,8 +185,10 @@ class Agent:
             try:
                 decision = future.result()
                 self._update(decision.pop('updates', None) or {}, t)
-                if self.future_scene != self.scene_id:   # decided for an earlier screen, e.g. Retry once play is back
-                    self.events.append((t, f'dropped a reply decided on screen #{self.future_scene}'))
+                self.stats['player replies'] += 1
+                if self.future_epoch != self.epoch:   # decided before the situation changed, e.g. a controller started
+                    self.stats['player replies dropped'] += 1
+                    self.events.append((t, f'dropped a player reply from decision #{self.future_epoch} (now #{self.epoch})'))
                 else:
                     action = self._apply(decision, t, image)
             except Exception as e:   # bad model reply: tell the player on its next call
@@ -200,16 +207,22 @@ class Agent:
             self._wake(t, 'ready')   # nothing is playing: ask the player for the next move
         if self.wake and self.future is None:
             self.future = self.pool.submit(self.think, obs, self.wake, self._view(t))
-            self.future_scene, self.wake = self.scene_id, None
+            self.future_epoch, self.wake = self.epoch, None
         self._schedule(obs, t)
-        self._measure(t, action)
+        self._measure(t, action, obs)
         return action or Action('skip')   # skip lets running inputs play on
 
     def _wake(self, t, event):
         self.events.append((t, event))
         self.wake = self.wake or event
 
-    def _measure(self, t, action):
+    def _bump(self):
+        self.epoch += 1
+
+    def _measure(self, t, action, obs):
+        self.stats['steps'] += 1
+        if action is None and not self.controller and not obs.program_left_s:   # nothing plays: idle
+            self.stats['idle steps'] += 1
         if any(j['key'] == 'writer' for j in self.jobs):   # how much play goes on while the writer works
             self.stats['steps while writing'] += 1
             self.stats['skips while writing'] += action is None
@@ -336,6 +349,7 @@ class Agent:
             self.probes = [{'label': label, 'action': action and Action(action['tool'], action.get('params') or {})}
                            for label, action in result['probe']]
             self.queue, self.memory['probes'] = [], []
+            self._bump()
 
     def _got_analyst_lesson(self, job, result, here, obs, t):
         if result and result.get('lesson'):
@@ -411,6 +425,7 @@ class Agent:
         if self.entry is not entry:
             self._stop(t, 'ok', f"replaced by #{entry['id']}")
         self.controller, self.entry, self.controller_mem = entry['fn'], entry, {}
+        self._bump()
         self.play_scenes.add(self.scene_id)
         self.controller_start = self.controller_t = entry['since'] = t
         entry['status'], self.probes, self.queue = 'running', [], []
@@ -512,10 +527,11 @@ class Agent:
         self.signal_t = t
         self.last_frames.append((t, jpeg))
         progress = False
-        small = thumb(image)
+        small = np.asarray(image.convert('L').resize((NOVEL_SIZE, NOVEL_SIZE)), np.float32)
         while self.recent_thumbs and self.recent_thumbs[0][0] < t - NOVEL_WINDOW_S:
             self.recent_thumbs.popleft()
-        if not self.recent_thumbs or min(np.abs(th - small).mean() for _, th in self.recent_thumbs) > NOVEL_DIFF:
+        if not self.recent_thumbs or min((np.abs(th - small) > NOVEL_PIXEL).mean()
+                                         for _, th in self.recent_thumbs) >= NOVEL_SHARE:
             self.novel_t, progress = t, True
         self.recent_thumbs.append((t, small))
         box = self.memory.get('display_box')   # the progress display the analyst located, grid x0, y0, x1, y1
@@ -541,13 +557,17 @@ class Agent:
             + (f'{count} of your last 10 actions were {pattern[0]} {pattern[1]}; ' if repeating else '')
             + f'attempt {len(self.attempts) + 1}, running {t - self.attempt_t:.0f} s'
             + (', earlier attempts lasted ' + ', '.join(f'{a:.0f} s' for a in self.attempts[-5:]) if self.attempts else ''))
-        quiet = t - self.novel_t >= STUCK_S and (repeating or not box or self.ticking or t - self.display_t >= STUCK_S)
+        # a changing progress display always counts as progress, repeated actions or not
+        quiet = t - self.novel_t >= STUCK_S and (not box or self.ticking or t - self.display_t >= STUCK_S)
         if quiet and t - self.stuck_t >= STUCK_S and not self.probes:
             self.stuck_t = t
-            if self.entry:
+            if self.entry:   # a controller plays: the checker judges it now, the player is left alone
                 self.entry['stuck'] = self.entry.get('stuck', 0) + 1
-            self._wake(t, f"no progress signal: {self.memory['signals']}. Try something fundamentally different, "
-                          'e.g. controls from your note you have not used yet')
+                self.controller_t = -float('inf')
+                self.events.append((t, f"no progress signal for #{self.entry['id']}: the checker looks now"))
+            else:
+                self._wake(t, f"no progress signal: {self.memory['signals']}. Try something fundamentally different, "
+                              'e.g. controls from your note you have not used yet')
 
     # --- scenes: screen changes, game over, restart ---
 
@@ -591,6 +611,7 @@ class Agent:
         self._stop(t, 'ok', 'the scene changed')
         self.queue = []                   # a replay that worked stops here, before it clicks into the next screen
         self.scene_id, self.scene_entered_t = new, t
+        self._bump()                      # also covers the replay that may start below
         ended = t - self.attempt_t        # measured before the next attempt's clock starts
         self.attempt_t = t
         if played:                        # a play screen gave way: the attempt ended (game over or next level)

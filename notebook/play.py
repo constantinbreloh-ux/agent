@@ -21,7 +21,7 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         game.initialize({'minutes': PLAY_SECONDS / 60})
         tools = game.tools()
         first_reply = len(Agent.replies)
-        turns, refused, step_s, tools_used = 0, [], [], Counter()
+        turns, refused, step_s, tools_used, keys = 0, [], [], Counter(), Counter()
         while not game.is_terminal():
             obs = game.get_observation()
             began = time.time()
@@ -30,6 +30,10 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
             result = game.handle_tool(action.tool, action.params)
             turns += 1
             tools_used[('controller: ' if agent.controller else '') + action.tool] += 1
+            p = action.params
+            for key in [p.get('key'), *(p.get('keys') or []), *(k for s in p.get('steps') or [] for k in s.get('keys') or [])]:
+                if key:
+                    keys[str(key).lower() if len(str(key)) == 1 else key] += 1   # every key pressed, by anyone
             if not result['ok'] and not game.is_terminal():
                 refused.append(result.get('error'))
             if turns % 5 == 0:
@@ -72,6 +76,10 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
                 if agent.stats['steps while writing'] else None,
                 'first scene change → first action s': agent.first_play_delay,
                 'checker verdicts': dict(agent.verdicts),
+                'player replies dropped share': round(agent.stats['player replies dropped'] / agent.stats['player replies'], 2)
+                if agent.stats['player replies'] else None,
+                'idle share (skip, no controller, no sequence)': round(agent.stats['idle steps'] / max(agent.stats['steps'], 1), 2),
+                'keys used': dict(keys.most_common()),
                 'variants': dict(agent.variants), 'display box': agent.memory.get('display_box'),
                 'display ticks like a clock': agent.ticking,
                 'probes': agent.memory.get('probes'), 'note': agent.memory.get('note'),
@@ -95,4 +103,9 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
               f"restart {row['restart → controller s']}  variants {row['variants']}  clock {row['display ticks like a clock']}\n"
               f"{'':20} player s alone/shared {row['player s alone / with others']}  skip while writing "
               f"{row['skip share while writing']}  first action {row['first scene change → first action s']} s  "
-              f"verdicts {row['checker verdicts']}\n{'':20} {row['roles']}")
+              f"verdicts {row['checker verdicts']}\n{'':20} {row['roles']}\n"
+              f"{'':20} idle {row['idle share (skip, no controller, no sequence)']}  "
+              f"player replies dropped {row['player replies dropped share']} (warning from 0.3)  keys {row['keys used']}")
+        if row['game'] == 'cavebots':
+            qwer = {k: row['keys used'].get(k, 0) for k in 'qwer'}
+            print(f"{'':20} Q/W/E/R pressed: {qwer}; built: not readable locally (no score reader), check the video")
