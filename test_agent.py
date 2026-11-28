@@ -28,8 +28,9 @@ def control(frame, mem):
     if mem['n'] > 5:
         mem['handoff'] = 'done dodging'
         return None
+    assert frame.shape == (1000, 1000, 3)
     x = frame[:, :, 0].mean(axis=0).argmax()   # brightest red column, a numpy int as models write it
-    return {"tool": "click", "params": {"x": x, "y": 10.4}}
+    return {"tool": "click", "params": {"x": x, "y": 500.4}}   # grid coordinates
 '''
 
 
@@ -68,7 +69,7 @@ def play(agent, seconds, start=0.0, **kw):
 agent = FakeModel([{'controller': CONTROLLER}, {'controller': 'def control(frame, mem): 1/0'}])
 actions = play(agent, 2.4)
 clicks = [a for a in actions if a.tool == 'click']
-assert len(clicks) == 5 and all(type(a.params['x']) is int and a.params['y'] == 10 and abs(a.params['x'] - 30) <= 1 for a in clicks), actions
+assert len(clicks) == 5 and all(type(a.params['x']) is int and a.params['y'] == 23 and abs(a.params['x'] - 30) <= 1 for a in clicks), actions
 assert agent.seen[:3] == ['new game', 'done dodging', 'controller crashed: ZeroDivisionError(\'division by zero\')'], agent.seen
 
 # 2. A sequence keeps the model asleep until it has played out.
@@ -133,7 +134,7 @@ o.info = {'description': 'd', 'controls': 'c', 'width': 64, 'height': 48, 'remai
 assert agent.think(o, 'ready', {}) == {'tool': 'click', 'params': {'x': 0, 'y': 47}}
 user = FakeServer.body['messages'][1]['content']
 assert user[0]['image_url']['url'].startswith('data:image/jpeg;base64,') and 'ready' in user[1]['text'], user
-assert agent.replies[-1][4] == 20
+assert agent.replies[-1][4] == 20 and agent.replies[0][1] == 'game note', agent.replies
 print('vllm request ok')
 
 # 8. Check-ins: a running controller wakes the model every CHECK_S, plays on meanwhile, and KEEP keeps it.
@@ -147,5 +148,7 @@ assert agent.controller is not None and agent.controller_code.startswith('def co
 held = [a for a in actions if a.tool == 'hold_keys']
 assert len(held) >= 10 and all(a.params['keys'] == ['a'] for a in held), actions   # played on, empty key dropped
 autopilot.CHECK_S = 10
-assert gemma.parse('Score: 40\nKEEP', 1, 1) == {'keep': True}
+assert gemma.parse('Progress: alive, 3 lives\nKEEP', 1, 1) == {'keep': True}
 print('check-in ok')
+assert gemma.parse('{"tool":"drag","params":{"x":0,"y":0,"x2":999,"y2":999}}', 641, 481)['params'] == {'x': 0, 'y': 0, 'x2': 640, 'y2': 480}
+print('drag ok')

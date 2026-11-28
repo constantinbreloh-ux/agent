@@ -19,6 +19,16 @@ CONTROLLER_MAX_S = 0.1     # a controller call slower than this is switched off
 SCENE_DIFF = 0.5           # share of pixels that must differ from ~1 s ago for a scene change
 SCENE_COOLDOWN_S = 2
 XY = {'x', 'y', 'x2', 'y2'}
+GRID = 1000                # the model's coordinates: 0-999 over the screen, in actions and controllers alike
+
+
+def to_pixels(params, width, height):
+    """0-999 grid coordinates -> the game's pixels, for an action's params and its sequence steps."""
+    for target in [params, *params.get('steps', [])]:
+        for key, size in (('x', width), ('y', height), ('x2', width), ('y2', height)):
+            if target.get(key) is not None:
+                target[key] = min(max(int(target[key]), 0), GRID - 1) * (size - 1) // (GRID - 1)
+    return params
 
 
 class Agent:
@@ -32,7 +42,8 @@ class Agent:
         or {"keep": True} to let the running controller play on.
 
         Controller code defines control(frame, mem) -> action dict, or None to hand control back.
-        frame is the screen as an RGB numpy array (pixels = action coordinates), mem a dict it keeps.
+        frame is the screen scaled to GRID x GRID, RGB numpy, so frame[y, x] is grid point (x, y);
+        mem is a dict it keeps. Its actions use grid coordinates, which the agent turns into pixels.
         To say why it hands back, it sets mem['handoff'] = '<reason>' before returning None.
         """
         return {'tool': 'skip', 'params': {}}
@@ -52,7 +63,8 @@ class Agent:
         if t < self.last_t:   # the clock started again: a new game
             self._reset()
         self.last_t = t
-        frame = np.asarray(Image.open(io.BytesIO(obs.image)).convert('RGB'))
+        image = Image.open(io.BytesIO(obs.image)).convert('RGB')
+        frame = np.asarray(image)
         self._check_scene(t, frame)
         if self.controller and obs.last_action.get('ok') is False:   # the game refused its last action
             self.controller = None
@@ -62,11 +74,11 @@ class Agent:
         if self.future and self.future.done():
             future, self.future = self.future, None
             try:
-                action = self._apply(future.result(), t, frame)
+                action = self._apply(future.result(), t, image)
             except Exception as e:   # bad model reply: tell the model on its next call
                 self._wake(t, f'your last reply failed: {e!r}')
         if action is None and self.controller:
-            action = self._run_controller(t, frame)
+            action = self._run_controller(t, image)
         if self.controller is None and self.future is None and not obs.program_left_s and not self.wake:
             self._wake(t, 'ready')   # nothing is playing: ask for the next move
         if self.wake and self.future is None:
@@ -78,7 +90,7 @@ class Agent:
         self.events.append((t, event))
         self.wake = self.wake or event
 
-    def _apply(self, decision, t, frame):
+    def _apply(self, decision, t, image):
         if decision.get('keep'):
             return None   # the running controller plays on
         if 'controller' in decision:
@@ -86,11 +98,12 @@ class Agent:
             exec(decision['controller'], namespace)   # trusted: only our own model writes this code
             self.controller, self.controller_mem = namespace['control'], {}
             self.controller_code, self.controller_start, self.controller_t = decision['controller'], t, t
-            return self._run_controller(t, frame)
+            return self._run_controller(t, image)
         self.controller = None
         return Action(decision['tool'], decision.get('params', {}))
 
-    def _run_controller(self, t, frame):
+    def _run_controller(self, t, image):
+        frame = np.asarray(image.resize((GRID, GRID)))
         start = time.time()
         try:
             # shortcut: an endless loop in control() hangs step(); move it to a subprocess if models write those
@@ -99,6 +112,7 @@ class Agent:
                 choice = json.loads(json.dumps(choice, default=lambda o: o.item()), object_hook=lambda d: {
                     k: round(v) if k in XY and isinstance(v, float) else [x for x in v if x != ''] if k == 'keys'
                     and isinstance(v, list) else v for k, v in d.items()})
+                choice['params'] = to_pixels(choice.get('params') or {}, *image.size)
         except Exception as e:
             self.controller = None
             self._wake(t, f'controller crashed: {e!r}')
@@ -113,7 +127,8 @@ class Agent:
         elif t - self.controller_t >= CHECK_S:
             self.controller_t = t   # it keeps playing while the model looks
             self._wake(t, f'check-in: your controller has played for {t - self.controller_start:.0f} s and plays on '
-                          'while you look. Is the score rising? KEEP it, or reply with a better controller or an action')
+                          'while you look. Is it making progress on what counts (your game note)? '
+                          'KEEP it, or reply with a better controller or an action')
         return Action(choice['tool'], choice.get('params', {}))
 
     def _check_scene(self, t, frame):
