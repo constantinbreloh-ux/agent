@@ -1,6 +1,7 @@
 # Notebook cell: Gemma as the model behind autopilot.Agent.
 # `processor` and `model` come from the setup cell; they are only used inside think().
 import io
+import time
 import json
 import re
 
@@ -28,12 +29,14 @@ Reply in exactly one of these two forms.
 def control(frame, mem):
     # frame: numpy uint8 array (H, W, 3), RGB, the full game screen; W and H are given below. np is numpy.
     # mem: a dict kept between calls.
-    # Return one action dict in PIXEL coordinates (not 0-999), same tools as above, e.g.
+    # Return one action dict in the frame's own pixel coordinates (never convert to the 0-999 grid),
+    # same tools as above, e.g.
     #   {"tool": "press_key", "params": {"key": "ArrowLeft"}}
     # or set mem["handoff"] = "<why>" and return None to give control back to you.
     ...
 ```
    Keep control() fast, well under 0.1 s: find things by color with numpy masks, never loop over pixels.
+   Write it short, with no comments: every line you write costs game time while the game runs on.
    Give control back when something happens it cannot handle.
 
 Prefer a sequence when it is enough. Test an uncertain control briefly with one action before you rely on it.
@@ -80,10 +83,12 @@ class Agent(AutoPilot):
             {'role': 'system', 'content': [{'type': 'text', 'text': RULES}]},
             {'role': 'user', 'content': [{'type': 'image'}, {'type': 'text', 'text': text}]},
         ]
+        began = time.time()
         prompt = processor.apply_chat_template(messages, add_generation_prompt=True)  # noqa: F821
         inputs = processor(text=prompt, images=[frame], return_tensors='pt').to(model.device)  # noqa: F821
         out = model.generate(**inputs, max_new_tokens=768, do_sample=False, prompt_lookup_num_tokens=20)  # noqa: F821
         reply = processor.decode(out[0, inputs['input_ids'].shape[1]:], skip_special_tokens=True)  # noqa: F821
         log.append(f'[{event}] ' + ' '.join(reply.split())[:300])
-        self.replies.append((obs.elapsed_s, event, reply))
+        tokens = out.shape[1] - inputs['input_ids'].shape[1]
+        self.replies.append((obs.elapsed_s, event, reply, time.time() - began, tokens))
         return parse(reply, info['width'], info['height'])

@@ -18,6 +18,7 @@ TIMEOUT_S = 120            # wake the model if a controller ran this long withou
 CONTROLLER_MAX_S = 0.1     # a controller call slower than this is switched off
 SCENE_DIFF = 0.5           # share of pixels that must differ from ~1 s ago for a scene change
 SCENE_COOLDOWN_S = 2
+XY = {'x', 'y', 'x2', 'y2'}
 
 
 class Agent:
@@ -89,8 +90,9 @@ class Agent:
         try:
             # shortcut: an endless loop in control() hangs step(); move it to a subprocess if models write those
             choice = self.controller(frame, self.controller_mem)
-            if choice is not None:   # numpy numbers -> plain ints/floats, which the game requires
-                choice = json.loads(json.dumps(choice, default=lambda o: o.item()))
+            if choice is not None:   # numpy numbers -> plain numbers, coordinates -> ints, as the game requires
+                choice = json.loads(json.dumps(choice, default=lambda o: o.item()), object_hook=lambda d: {
+                    k: round(v) if k in XY and isinstance(v, float) else v for k, v in d.items()})
         except Exception as e:
             self.controller = None
             self._wake(t, f'controller crashed: {e!r}')

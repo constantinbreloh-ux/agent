@@ -63,7 +63,7 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
     print('Actions:', dict(tools_used))
     print('Events:', agent.events)
     with open('/kaggle/working/replies.txt', 'w') as f:   # every Gemma reply, to read after the run
-        for elapsed, event, reply in Agent.replies:
-            f.write(f'=== {elapsed:.1f} s, {event}\n{reply}\n\n')
-    for elapsed, event, reply in Agent.replies[-3:]:
-        print(f'\n=== {elapsed:.1f} s, {event}\n{reply}')
+        for elapsed, event, reply, secs, tokens in Agent.replies:
+            f.write(f'=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens)\n{reply}\n\n')
+    for elapsed, event, reply, secs, tokens in Agent.replies[-3:]:
+        print(f'\n=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens)\n{reply}')
