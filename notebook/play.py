@@ -40,12 +40,20 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         score = game.get_score()   # local runs only: the game's own counter, normalized 0..1 like the leaderboard
         replies = Agent.replies[first_reply:]
         log.write(f'##### {name}\n')   # written first: an error in the measurements below must not lose it
-        for elapsed, event, reply, secs, tokens in replies:
-            log.write(f'=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens)\n{reply}\n\n')
+        for elapsed, event, reply, secs, tokens, role, together in replies:
+            log.write(f'=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens, {together} at once)\n{reply}\n\n')
         log.flush()
         print('Events:', [(round(t, 1), e[:100]) for t, e in agent.events])
         try:
-            writes = [r for r in replies if '```python' in r[2]]
+            writes = [r for r in replies if r[5] in ('writer', 'variant')]
+            def median(values):
+                values = list(values)
+                return round(statistics.median(values), 1) if values else None
+            roles = {role: f"{sum(r[5] == role for r in replies)} calls, {median(r[3] for r in replies if r[5] == role)} s, "
+                           f"{median(r[4] for r in replies if r[5] == role)} tok"
+                     for role in ('player', 'writer', 'variant', 'checker', 'analyst')}
+            alone = median(r[3] for r in replies if r[5] == 'player' and r[6] == 1)
+            shared = median(r[3] for r in replies if r[5] == 'player' and r[6] > 1)
             stuck = [(round(t), e[:60]) for t, e in agent.events if e.startswith('no progress')]
             row = {
                 'game': name, 'metric': specs[name]['scoring']['metric'], 'score': score,
@@ -59,6 +67,11 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
                 'library (id, what, status, signals/min, read progress/min)': [
                     (e['id'], e['desc'][:40], e['status'], round(agent.rate(e, obs.elapsed_s)), round(agent.gain(e)))
                     for e in agent.library],
+                'roles': roles, 'player s alone / with others': (alone, shared),
+                'skip share while writing': round(agent.stats['skips while writing'] / agent.stats['steps while writing'], 2)
+                if agent.stats['steps while writing'] else None,
+                'first scene change → first action s': agent.first_play_delay,
+                'checker verdicts': dict(agent.verdicts),
                 'variants': dict(agent.variants), 'display box': agent.memory.get('display_box'),
                 'display ticks like a clock': agent.ticking,
                 'probes': agent.memory.get('probes'), 'note': agent.memory.get('note'),
@@ -79,4 +92,7 @@ if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         print(f"{row['game']:20} score {row['score']}  skip {row['skip share']}  refused {row['refused']}  "
               f"reply {row['reply s median']} s / {row['tokens median']} tok  writes/min {row['controller writes/min']}  "
               f"attempts {row['attempts']} {row['attempt s']}  no-progress {len(row['no-progress wakes'])}  "
-              f"restart {row['restart → controller s']}  variants {row['variants']}  clock {row['display ticks like a clock']}")
+              f"restart {row['restart → controller s']}  variants {row['variants']}  clock {row['display ticks like a clock']}\n"
+              f"{'':20} player s alone/shared {row['player s alone / with others']}  skip while writing "
+              f"{row['skip share while writing']}  first action {row['first scene change → first action s']} s  "
+              f"verdicts {row['checker verdicts']}\n{'':20} {row['roles']}")

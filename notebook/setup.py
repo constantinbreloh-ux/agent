@@ -39,7 +39,7 @@ log('read the weights')
 
 server = subprocess.Popen(
     ['vllm', 'serve', str(weights), '--port', '8000', '--served-model-name', 'gemma', '--max-model-len', '16384',
-     '--gpu-memory-utilization', '0.9', '--max-num-seqs', '8', '--limit-mm-per-prompt', '{"image": 6}'],
+     '--gpu-memory-utilization', '0.9', '--max-num-seqs', '8', '--limit-mm-per-prompt', '{"image": 6}', '--scheduling-policy', 'priority'],
     stdout=open('/kaggle/working/vllm.log', 'w'), stderr=subprocess.STDOUT)
 while True:   # the competition allows 15 minutes for everything before the inference server listens
     try:

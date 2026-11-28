@@ -73,3 +73,11 @@ und lädt Log + `replies.txt` nach `runs/<version>/`. Der Kaggle-Token liegt im 
    Game Over = Rückkehr auf einen Bildschirm, den Gemma schon einmal verlassen hat → Bilder der letzten Sekunden + `Lesson:`.
 4. Controller-Library pro Spiel; nach Game Over Replay der Ausstiegsaktionen und Neustart des besten Controllers;
    Varianten parallel, behalten nur bei > 1,2× Fortschrittssignalen/min.
+
+## Sub-Agent-System (Stufe 0–2 eingebaut, Stufe 3 offen)
+
+Dirigent = Python (`autopilot.Agent._step`), einziger Schreiber von Memory und Library. Rollen über denselben
+vLLM-Server (`--scheduling-policy priority`, Spieler priority 0, Rest 1), höchstens 2 Hintergrund-Aufrufe:
+Spieler (Aktion / KEEP / REUSE / WRITE: Ziel), Schreiber, Varianten-Schreiber, Prüfer (alle 10 s KEEP/REPLACE),
+Analyst (Notiz, Steuerungs-Check, Lehre). Ergebnisse tragen ihre Szene; falsche Szene → Library statt Start.
+Stufe 0: neuer Bildinhalt nur gegen die letzten 30 s. Stufe 3 (Turnier) folgt im nächsten Lauf.

@@ -1,8 +1,9 @@
-# Notebook cell: Gemma, served by vLLM on localhost (setup cell), as the model behind autopilot.Agent.
+# Notebook cell: Gemma, served by vLLM on localhost (setup cell), in every role of autopilot.Agent.
 import base64
 import io
 import json
 import re
+import threading
 import time
 import urllib.request
 
@@ -29,51 +30,61 @@ Shift, Escape. Every reply except skip replaces what is still playing.
     a timed program of up to 200 steps that plays while you think. Each step holds exactly its keys and
     buttons (all else is released) for duration_ms; x, y are optional. The last step stays held.'''
 
-RULES = f'''You play a real-time browser game from screenshots. The game keeps running while you think, and each
-of your replies takes seconds, so prefer moves that keep playing on their own.
+PLAYER = f'''You play a real-time browser game from screenshots, as the fast player of a team. The game keeps
+running while you think: answer quickly and keep the game moving.
 
 {TOOLS}
 
-Start every reply with one line: Progress: <what counts in this game (your game note), as it stands on this
-screen, e.g. "score 120", "alive, 3 lives", "level 2", "distance 450", "timer 1:20", or "unknown">
-If a line of your game note is wrong, add a line: Note: <the corrected line, e.g. "Progress display: 0,930,999,999">
-After a game over, add a line: Lesson: <what ended the run and what you change>
-Then reply in exactly one of these four forms.
+Your reply:
+Progress: <what counts in this game (game note), as it stands on this screen, e.g. "score 120",
+  "alive, 3 lives", "level 2", "timer 1:20", or "unknown">
+Note: <only if a line of the game note is wrong: the corrected line, e.g. "Progress display: 0,930,999,999">
+Then exactly one of:
+- one action as JSON on one line, from the tools above
+- KEEP             while a controller plays and works
+- REUSE #<id>      restart a controller from the library
+- WRITE: <goal>    a writer writes a controller for this goal (what it should find on screen and what it
+                   should do) in about 10 s while you keep playing; it starts by itself when ready.
+                   Ask for one when the game needs fast reactions (dodging, aiming, steering, timing).
+Prefer a sequence for fixed routes and menu paths. If a menu or game-over screen shows, start the game the
+way the brief or the screen says. If something did not help, try something different. Never repeat what
+the library lists as failed.'''
 
-1. One action, as JSON on one line, from the tools above.
-
-2. A controller: Python code that plays every 200 ms from the screen without you. Use it when the game
-   needs fast reactions (dodging, aiming, steering, timing jumps).
+CONTROLLER = '''A controller is Python code that plays every 200 ms from the screen:
 ```python
 # skill: <one line: what this controller does>
 def control(frame, mem):
     # frame: numpy uint8 array (1000, 1000, 3), RGB: the screen scaled to the 0-999 grid, so frame[y, x]
     #        is grid point (x, y). np.argwhere returns (y, x). np is numpy.
     # mem: a dict kept between calls.
-    # Return one action dict from the tools above, in grid coordinates as they come from frame,
-    # or set mem["handoff"] = "<why>" and return None to give control back to you.
+    # Return one action dict from the tools, in grid coordinates as they come from frame,
+    # or set mem["handoff"] = "<why>" and return None to give control back.
     ...
 ```
-   Rules for controllers:
-   - The first line is "# skill: <one line>"; it is the only comment. No other comments, docstrings or
-     blank lines: every token you write costs game time.
-   - Use the coordinates from frame as they are: frame already is the grid, never rescale them.
-   - Act on what you detect: aim at the targets you found, move away from the threats you found.
-     Code that finds things and then ignores them is useless.
-   - Serve what counts in this game (your game note): survive, score, go fast or get far.
-   - Fast, well under 0.1 s per call: numpy color masks, never Python loops over pixels.
-   - Give control back when something happens it cannot handle.
+Rules:
+- The first line is "# skill: <one line>"; it is the only comment. No other comments, docstrings or blank lines.
+- Use the coordinates from frame as they are: frame already is the grid, never rescale them.
+- Act on what you detect: aim at the targets you found, move away from the threats you found.
+- Serve what counts in this game (the game note): survive, score, go fast or get far.
+- Fast, well under 0.1 s per call: numpy color masks, never Python loops over pixels.
+- Give control back when something happens it cannot handle.
+Reply with one python block only.'''
 
-3. KEEP
-   Only while your controller is playing and it works: it plays on unchanged. When what counts is
-   survival and you are still alive, that is progress.
+WRITER = f'''You write controllers for a real-time browser game, for a teammate who plays meanwhile.
 
-4. REUSE #<id>
-   Restart a controller from your library below.
+{TOOLS}
 
-Prefer a sequence when it is enough. Test an uncertain control briefly with one action before you rely on it.
-If a menu or game-over screen shows, start the game the way the brief or the screen says.
-If something you tried did not help, try something different. Never repeat what your library lists as failed.'''
+{CONTROLLER}'''
+
+VARY = '''Below is a controller that works. Write a variant that should do clearly better at what counts, e.g.
+the same plus dodging, better aim, or a control it ignores.'''
+
+CHECKER = '''You check a controller that plays a real-time browser game. The images show the last seconds, oldest
+first; the last image is now. Reply in exactly three lines:
+Progress: <the number for what counts (game note) on the last image, or unknown>
+Verdict: KEEP or REPLACE
+Reason: <one line: what the controller does well or wrong, and what a better one should do>
+REPLACE only when it clearly fails at what counts; while it works, KEEP.'''
 
 NOTE = '''Look at the screen and the brief, then write a short game note, exactly these six lines:
 Type: <the kind of game, e.g. shooter, platformer, puzzle, racing, strategy, idle, card>
@@ -87,23 +98,26 @@ Strategy: <from what counts: for survival take few risks; for points try a lot; 
 REVISE = NOTE + '''
 The game is running now. Your note so far is below; correct every line this screen shows better.'''
 
-PROBE = '''The game is running. Plan a quick control check: one test action for each control the brief or your
+PROBE = '''The game is running. Plan a quick control check: one test action for each control the brief or the
 note names (each key, each mouse action), so you see what each one does. Skip any that restart, pause,
 quit, or open settings or menus. At most 8 lines, each: <control>: <one JSON action from the tools>
 Example:
 Q (build): {"tool":"press_key","params":{"key":"q"}}
 left click (dig): {"tool":"click","params":{"x":500,"y":500}}'''
 
-VARY = '''Below is one of your controllers that works. Write a variant that should do clearly better at what
-counts, e.g. the same plus dodging, better aim, or using a control it ignores. Reply with one python
-block only, first line "# skill: <one line>", same rules as before.'''
+LESSON = '''A run of a real-time browser game just ended (or a level changed). The images show the last seconds
+before it, oldest first; the last image is now. Reply in one line:
+Lesson: <what ended the run, and what to do differently next time>'''
 
 
 def parse(reply, width, height):
-    """Gemma's reply -> a decision for autopilot.Agent (actions in pixels). Raises ValueError if none."""
+    """The player's reply -> a decision for autopilot.Agent (actions in pixels). Raises ValueError if none."""
     code = re.search(r'```python\n(.*?)(```|$)', reply, re.S)
     if code:
         return {'controller': code.group(1)}
+    write = re.search(r'^\s*WRITE:\s*(.+)$', reply, re.M)
+    if write:
+        return {'write': write.group(1).strip()}
     start = reply.find('{')
     if start < 0:
         reuse = re.search(r'\bREUSE\s*#?(\d+)', reply)
@@ -111,7 +125,7 @@ def parse(reply, width, height):
             return {'reuse': int(reuse.group(1))}
         if re.search(r'\bKEEP\b', reply):
             return {'keep': True}
-        raise ValueError('reply had no JSON action, python block, KEEP or REUSE')
+        raise ValueError('reply had no JSON action, KEEP, REUSE or WRITE')
     choice = json.JSONDecoder().raw_decode(reply[start:])[0]
     return {'tool': choice['tool'], 'params': to_pixels(choice.get('params') or {}, width, height)}
 
@@ -142,9 +156,20 @@ def display_box(text):
     return (x0, y0, x1, y1) if x0 < x1 and y0 < y1 else None
 
 
-def chat(messages, max_tokens):
-    """One reply from the vLLM server: (text, tokens generated)."""
-    body = json.dumps({'model': 'gemma', 'messages': messages, 'max_tokens': max_tokens, 'temperature': 0}).encode()
+def first_number(text):
+    found = re.search(r'-?\d[\d,]*\.?\d*', text or '')
+    return float(found.group(0).replace(',', '')) if found else None
+
+
+def python_block(reply):
+    code = re.search(r'```python\n(.*?)(```|$)', reply, re.S)
+    return code and code.group(1)
+
+
+def chat(messages, max_tokens, priority=0):
+    """One reply from the vLLM server: (text, tokens generated). Lower priority is served first."""
+    body = json.dumps({'model': 'gemma', 'messages': messages, 'max_tokens': max_tokens, 'temperature': 0,
+                       'priority': priority}).encode()
     request = urllib.request.Request(SERVER, body, {'Content-Type': 'application/json'})
     with urllib.request.urlopen(request, timeout=85) as response:
         out = json.load(response)
@@ -152,9 +177,11 @@ def chat(messages, max_tokens):
 
 
 class Agent(AutoPilot):
-    replies = []   # every reply of every game, for reading after a run
+    replies = []   # every call of every game: (game time, role: event, reply, seconds, tokens, role, calls at once)
+    in_flight = 0
+    lock = threading.Lock()
 
-    def ask(self, obs, event, system, text, max_tokens, images=()):
+    def ask(self, obs, role, event, system, text, max_tokens, images=()):
         content = []
         for jpeg in [*images, obs.image]:
             frame = Image.open(io.BytesIO(jpeg)).convert('RGB')
@@ -164,85 +191,105 @@ class Agent(AutoPilot):
             content.append({'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,'
                                                                       + base64.b64encode(out.getvalue()).decode()}})
         content.append({'type': 'text', 'text': text})
+        with Agent.lock:
+            Agent.in_flight += 1
+            together = Agent.in_flight
         began = time.time()
-        reply, tokens = chat([{'role': 'system', 'content': system}, {'role': 'user', 'content': content}], max_tokens)
-        self.replies.append((obs.elapsed_s, event, reply, time.time() - began, tokens))
+        try:
+            reply, tokens = chat([{'role': 'system', 'content': system}, {'role': 'user', 'content': content}],
+                                 max_tokens, priority=0 if role == 'player' else 1)   # the player goes first
+        finally:
+            with Agent.lock:
+                Agent.in_flight -= 1
+        Agent.replies.append((obs.elapsed_s, f'{role}: {event}', reply, time.time() - began, tokens, role, together))
         return reply
 
-    def library_text(self, memory, t):
-        lines = []
-        for e in memory['library']:
-            if e['status'] in ('ok', 'running') or e['status'].startswith('worse'):
-                read = e['readings']
-                lines.append(f"#{e['id']} [screen {e['scene']}] {e['desc']}: played {self.runtime(e, t):.0f} s, "
-                             + (f"progress you read {read[0][1]:g} -> {read[-1][1]:g}, " if len(read) > 1 else '')
-                             + f"{self.rate(e, t):.0f} progress signals/min, {e['status']}")
-            else:
-                lines.append(f"#{e['id']} {e['desc']}: FAILED ({e['status']}: {e['reason'][:100]})")
-        return '\n'.join(lines[-12:]) or 'empty'
+    @staticmethod
+    def brief(obs):
+        return f"Brief: {obs.info['description']} Controls: {obs.info['controls']}\n"
 
-    def note_text(self, memory):
-        return memory['note'] + ''.join(f'\nCorrection: {fix}' for fix in memory.get('fixes', [])[-3:])
+    @staticmethod
+    def note_text(view):
+        if view['note'] is None:
+            return 'not written yet'
+        return view['note'] + ''.join(f'\nCorrection: {fix}' for fix in view['fixes'][-3:])
 
-    def think(self, obs, event, memory):
-        info, t = obs.info, obs.elapsed_s
-        brief = f"Brief: {info['description']} Controls: {info['controls']}\n"
-        if 'note' not in memory:   # at the very start, often a menu: rewritten once the game shows
-            memory['note'] = self.ask(obs, 'game note', NOTE, brief, 250).strip()
-        elif ((event.startswith('the scene changed') and not memory.get('note_after_scene'))
-              or (t >= 20 and not memory.get('note_at_20s'))):
-            memory['note_after_scene' if event.startswith('the scene changed') else 'note_at_20s'] = True
-            memory['note'] = self.ask(obs, 'game note revised', REVISE,
-                                      brief + 'Your note so far:\n' + self.note_text(memory), 250).strip()
-            memory['fixes'] = []
-        memory['display_box'] = display_box(self.note_text(memory))
-        if not memory.get('probed') and (memory.get('note_after_scene') or memory.get('note_at_20s')):
-            memory['probed'] = True   # once per game, as soon as the game itself runs
-            probes = parse_probe(self.ask(obs, 'control check', PROBE + '\n\n' + TOOLS,
-                                          brief + 'Your game note:\n' + self.note_text(memory), 300),
-                                 info['width'], info['height'])
-            if len(probes) > 1:
-                return {'probe': probes}
+    def context(self, obs, view):
+        return (self.brief(obs) + f"Game note:\n{self.note_text(view)}\n"
+                + ('Control check, what each control changed on screen:\n' + '\n'.join(view['probes']) + '\n'
+                   if view['probes'] else '')
+                + ('Lessons from earlier runs: ' + ' | '.join(view['lessons'][-3:]) + '\n' if view['lessons'] else '')
+                + f"Controller library:\n{view['library']}\n")
 
-        log = memory.setdefault('log', [])
-        progress = memory.setdefault('progress', [])
-        lessons = memory.setdefault('lessons', [])
-        game_over = event.startswith('game over')
-        text = (
-            brief + f"Your game note:\n{self.note_text(memory)}\n"
-            + ('Control check, what each control changed on screen:\n' + '\n'.join(memory['probes']) + '\n'
-               if memory.get('probes') else '')
-            + f"Time left: {info['remaining_s']:.0f} s.\n"
-            f"What just happened: {event}.\n"
-            f"Result of the last action: {obs.last_action}\n"
-            f"Measured on screen: {memory.get('signals', 'nothing yet')}\n"
-            + ('Lessons from earlier runs: ' + ' | '.join(lessons[-3:]) + '\n' if lessons else '')
-            + "Progress you read so far (game time: progress): "
-            + (', '.join(f'{pt:.0f} s: {p}' for pt, p in progress[-10:]) or 'none') + '\n'
-            + f"Your controller library:\n{self.library_text(memory, t)}\n"
-            + (f"Playing now: #{self.entry['id']}, for {t - self.controller_start:.0f} s. Its code:\n"
-               f"```python\n{self.entry['code']}```\n" if self.controller and self.entry else '')
-            + ('The first images show the last seconds before the game over, oldest first; the last image is now.\n'
-               if game_over else '')
-            + "Your recent replies, oldest first:\n" + ('\n'.join(log[-6:]) or 'none') + '\nYour reply:'
-        )
-        before = [jpeg for _, jpeg in list(memory['last_frames'])[-6:-1]] if game_over else []
-        reply = self.ask(obs, event, RULES, text, 768, before)
-        log.append(f'[{event[:60]}] ' + ' '.join(reply.split())[:300])
-        number = re.search(r'^\s*Progress:\D*?(-?\d[\d,]*\.?\d*)', reply, re.M)
-        if number and self.controller and self.entry:   # the number it read, to compare controllers by
-            self.entry['readings'].append((t, float(number.group(1).replace(',', ''))))
-        for key, store in (('Progress', progress), ('Lesson', lessons), ('Note', memory.setdefault('fixes', []))):
-            found = re.search(rf'^\s*{key}:\s*(.+)$', reply, re.M)
-            if found:
-                store.append((t, found.group(1).strip()[:40]) if key == 'Progress' else found.group(1).strip()[:200])
-        return parse(reply, info['width'], info['height'])
+    # --- the roles ---
 
-    def vary(self, obs, entry, memory):
-        info = obs.info
-        text = (f"Brief: {info['description']} Controls: {info['controls']}\n"
-                f"Your game note:\n{self.note_text(memory)}\n"
-                f"Controller #{entry['id']} ({entry['desc']}), {self.rate(entry, obs.elapsed_s):.0f} progress signals/min:\n"
+    def think(self, obs, event, view):
+        playing = view['playing']
+        text = (self.context(obs, view)
+                + f"Time left: {obs.info['remaining_s']:.0f} s.\n"
+                f"What just happened: {event}.\n"
+                f"Result of the last action: {obs.last_action}\n"
+                f"Measured on screen: {view['signals']}\n"
+                "Progress you read so far (game time: progress): "
+                + (', '.join(f'{pt:.0f} s: {p}' for pt, p in view['progress'][-10:]) or 'none') + '\n'
+                + (f"Playing now: controller #{playing['id']} ({playing['desc']}), for {playing['seconds']:.0f} s.\n"
+                   if playing else 'No controller is playing.\n')
+                + (f"The writer is writing: {view['writing']}\n" if view['writing'] else '')
+                + "Your recent replies, oldest first:\n" + ('\n'.join(view['log'][-6:]) or 'none') + '\nYour reply:')
+        reply = self.ask(obs, 'player', event, PLAYER, text, 200)
+        progress = re.search(r'^\s*Progress:\s*(.+)$', reply, re.M)
+        fix = re.search(r'^\s*Note:\s*(.+)$', reply, re.M)
+        decision = parse(reply, obs.info['width'], obs.info['height'])
+        decision['updates'] = {
+            'log': f'[{event[:60]}] ' + ' '.join(reply.split())[:200],
+            'progress': progress and (progress.group(1).strip()[:40], first_number(progress.group(1))),
+            'note_fix': fix and fix.group(1).strip()[:200],
+            'display_box': fix and display_box(fix.group(0)),
+        }
+        return decision
+
+    def write(self, obs, goal, view):
+        playing = view['playing']
+        text = (self.context(obs, view)
+                + (f"The controller playing now, #{playing['id']}:\n```python\n{playing['code']}```\n"
+                   if playing and goal.startswith('replace') else '')
+                + f"Write a controller for this goal: {goal}")
+        return python_block(self.ask(obs, 'writer', goal[:60], WRITER, text, 1500))
+
+    def vary(self, obs, entry, view):
+        text = (self.context(obs, view) + f"Controller #{entry['id']} ({entry['desc']}):\n"
                 f"```python\n{entry['code']}```\n{VARY}")
-        code = re.search(r'```python\n(.*?)(```|$)', self.ask(obs, f"variant of #{entry['id']}", RULES, text, 768), re.S)
-        return code and code.group(1)
+        return python_block(self.ask(obs, 'variant', f"of #{entry['id']}", WRITER, text, 1500))
+
+    def check(self, obs, view):
+        playing = view['playing']
+        if not playing:
+            return None
+        read = ', '.join(f'{v:g}' for _, v in playing['readings'][-5:]) or 'none yet'
+        text = (self.context(obs, view)
+                + f"Controller #{playing['id']} ({playing['desc']}) has played for {playing['seconds']:.0f} s. "
+                f"Numbers read so far: {read}. Measured on screen: {view['signals']}\n"
+                f"```python\n{playing['code']}```")
+        reply = self.ask(obs, 'checker', f"#{playing['id']}", CHECKER, text, 120, view['frames'][-6:-1])
+        verdict = re.search(r'Verdict:\s*(KEEP|REPLACE)', reply)
+        reason = re.search(r'^\s*Reason:\s*(.+)$', reply, re.M)
+        progress = re.search(r'^\s*Progress:\s*(.+)$', reply, re.M)
+        return {'verdict': verdict.group(1) if verdict else 'KEEP', 'reason': reason.group(1).strip() if reason else '',
+                'reading': first_number(progress.group(1)) if progress else None}
+
+    def analyse(self, obs, task, view):
+        width, height = obs.info['width'], obs.info['height']
+        if task == 'note':
+            revise = view['note'] is not None
+            reply = self.ask(obs, 'analyst', 'note revised' if revise else 'note', REVISE if revise else NOTE,
+                             self.brief(obs) + ('Your note so far:\n' + self.note_text(view) if revise else ''), 250)
+            return {'note': reply.strip(), 'display_box': display_box(reply)}
+        if task == 'probe':
+            reply = self.ask(obs, 'analyst', 'control check', PROBE + '\n\n' + TOOLS,
+                             self.brief(obs) + 'Game note:\n' + self.note_text(view), 300)
+            return {'probe': parse_probe(reply, width, height)}
+        if task == 'lesson':
+            reply = self.ask(obs, 'analyst', 'lesson', LESSON, self.context(obs, view), 150, view['frames'][-6:-1])
+            lesson = re.search(r'Lesson:\s*(.+)', reply)
+            return {'lesson': (lesson.group(1) if lesson else reply).strip()[:200]}
+        return None

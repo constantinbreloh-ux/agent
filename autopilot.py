@@ -1,16 +1,21 @@
-"""AutoPILOT-style agent for the Generalist Gaming Agent competition.
+"""AutoPILOT-style agent for the Generalist Gaming Agent competition: a Python conductor and model roles.
 
-step() never waits for the model. The model (`think`) runs in a background thread and is only woken by
-events. Its decision is one game action, a controller (Python code it writes, which then plays every
-decision point from the screen), a control check, KEEP or REUSE of a stored controller.
+step() never waits for a model. It is the conductor: the only code that changes memory and the controller
+library. Model roles run in threads and only return results, each tagged with the screen it was meant for:
+- player   (one at a time, fast): an action, KEEP, REUSE #id, or WRITE: <goal> for the writer
+- writer   (background): a controller for a goal; it starts by itself if its screen still shows,
+           otherwise it goes into the library
+- variant  (background): a variant of a working controller, tried for TRIAL_S against its parent
+- checker  (background, every CHECK_S while a controller plays): KEEP or REPLACE, with the number it reads;
+           REPLACE sends the writer a goal
+- analyst  (background): the game note and its revisions, the control check plan, the lesson after a game over
+At most MAX_BACKGROUND background calls run at once; the player runs beside them.
 
-Without the model, about once a second, the agent measures image signals: new screen content, changes in
-the progress display the model located (unless it ticks like a clock), repeated actions, and wakes the
-model when nothing moves for STUCK_S. Screens are told apart: a play screen is one a controller played on
-or the agent stayed on for PLAY_S; leaving one ends an attempt (game over or next level). Menu screens
-remember the actions that led off them, and the agent replays those when the screen shows again. Every
-controller is kept per game in a library with its results; when a play screen shows again its best
-controller restarts at once, and model-written variants of a working controller are tried in parallel.
+Without a model, about once a second, the conductor measures image signals: new screen content against
+the last NOVEL_WINDOW_S, changes in the progress display the analyst located (unless it ticks like a
+clock), repeated actions; nothing for STUCK_S wakes the player. A play screen is one a controller played
+on or the agent stayed on for PLAY_S; leaving one ends an attempt. Menus remember the actions that led off
+them and the conductor replays them; a play screen that shows again restarts its best controller.
 """
 import io
 import json
@@ -22,14 +27,15 @@ import numpy as np
 from PIL import Image
 from gga.protocol import Action
 
-CHECK_S = 10               # while a controller plays, the model looks at it this often
+CHECK_S = 10               # while a controller plays, the checker looks at it this often
 CONTROLLER_MAX_S = 0.1     # a controller call slower than this is switched off
 SCENE_DIFF = 0.5           # share of pixels that must differ from ~1 s ago for a scene change
 SCENE_COOLDOWN_S = 2
 SCENE_MATCH = 12           # mean abs difference of 16x16 gray thumbnails under which two screens are one scene
 NOVEL_DIFF = 10            # ... over which a screen counts as new content
+NOVEL_WINDOW_S = 30        # new against the screens of the last this many seconds, not the whole game
 DISPLAY_DIFF = 6           # mean abs change in the progress display box that counts as the display changing
-STUCK_S = 15               # no progress signal this long: wake the model
+STUCK_S = 15               # no progress signal this long: wake the player
 PROBE_WAIT = 4             # decision points (200 ms) to watch after each control-check action
 REPLAY_GAP_S = 0.6         # between replayed restart actions
 VARY_AFTER_S = 20          # a controller running this long gets a variant tried
@@ -37,6 +43,8 @@ TRIAL_S = 15               # how long a variant plays before it is compared with
 BEST_MIN_S = 5             # a controller must have played this long to be restarted as the best
 PLAY_S = 20                # a screen the agent stays on this long is a play screen, not a menu
 TICKING = 8                # a display that changed in this many of the last 10 seconds is a clock
+NOTE_RECHECK_S = 20        # the analyst revises the note once at this game time
+MAX_BACKGROUND = 2         # background model calls at once
 XY = {'x', 'y', 'x2', 'y2'}
 GRID = 1000                # the model's coordinates: 0-999 over the screen, in actions and controllers alike
 
@@ -56,49 +64,96 @@ def thumb(image):
 
 class Agent:
     def __init__(self):
-        self.pool = ThreadPoolExecutor(1)
-        self.variant_pool = ThreadPoolExecutor(1)   # its calls run beside the model's; vLLM batches them
+        self.pool = ThreadPoolExecutor(1)                        # the player
+        self.background = ThreadPoolExecutor(MAX_BACKGROUND)     # writer, variant, checker, analyst
         self.last_t = float('inf')
         self._reset()
 
-    def think(self, obs, event, memory):
-        """Override with the model. Returns one of
+    # --- the model roles: override them. Each gets a snapshot `view` (see _view) and returns a result. ---
+
+    def think(self, obs, event, view):
+        """The player. Returns a decision:
         {"tool": ..., "params": {...}}         an action, in pixels
-        {"controller": "<code>"}              code defining control(frame, mem) -> action dict or None
-        {"probe": [(label, action or None)]}  a control check: each action once, then watch what changes
         {"keep": True}                        the running controller plays on
         {"reuse": <library id>}               restart a stored controller
-
-        frame is the screen scaled to GRID x GRID, RGB numpy, so frame[y, x] is grid point (x, y);
-        mem is a dict it keeps. Its actions use grid coordinates, which the agent turns into pixels.
-        To say why it hands back, it sets mem['handoff'] = '<reason>' before returning None.
+        {"write": "<goal>"}                   ask the writer for a controller; keep playing meanwhile
+        {"controller": "<code>"} or {"probe": [(label, action or None)]} are accepted too.
+        Optional "updates": {"progress": (text, number or None), "note_fix": str, "log": str}.
         """
         return {'tool': 'skip', 'params': {}}
 
-    def vary(self, obs, entry, memory):
-        """Override with the model: code of a variant of library entry `entry` that should do better, or None."""
+    def write(self, obs, goal, view):
+        """The writer: code defining control(frame, mem) -> action dict (grid coordinates) or None to hand
+        back, for `goal`. frame is the screen scaled to GRID x GRID, RGB numpy. Or None."""
         return None
 
+    def vary(self, obs, entry, view):
+        """The variant writer: code of a variant of `entry` (id, desc, code) that should do better, or None."""
+        return None
+
+    def check(self, obs, view):
+        """The checker: {"verdict": "KEEP" | "REPLACE", "reason": str, "reading": number or None}, or None.
+        view['frames'] holds the last seconds as jpegs, view['playing'] the running controller."""
+        return None
+
+    def analyse(self, obs, task, view):
+        """The analyst. task 'note' -> {"note": str, "display_box": (x0, y0, x1, y1) or None};
+        'probe' -> {"probe": [(label, action or None)]}; 'lesson' -> {"lesson": str}. Or None."""
+        return None
+
+    # --- state ---
+
     def _reset(self):
-        self.future = self.variant = None   # shortcut: a call still running from the last game delays this one
-        self.memory = {}                    # per game, shared with the model
-        self.library = self.memory['library'] = []
-        self.last_frames = self.memory['last_frames'] = deque(maxlen=8)   # (game time, jpeg), one a second
-        self.attempts = self.memory['attempts'] = []                      # durations of ended attempts
+        self.future = None                  # shortcut: calls still running from the last game delay this one
+        self.jobs = []                      # background calls: {key, role, scene, future, ...}
+        self.memory = {'note': None, 'fixes': [], 'probes': [], 'lessons': [], 'progress': [], 'log': [],
+                       'display_box': None, 'signals': 'nothing yet'}
+        self.library = []
+        self.last_frames = deque(maxlen=12)   # (game time, jpeg), one a second
+        self.attempts = []                    # durations of ended attempts
         self.controller = self.entry = self.trial = None
         self.probes, self.queue, self.queue_t = [], [], 0
         self.wake = 'new game'
-        self.events = []                    # (game time, event) log, for debugging
+        self.writing = None                   # the writer's current goal
+        self.notes_due, self.notes_done, self.probed = [], set(), False
+        self.events = []                      # (game time, event) log, for debugging
         self.scenes = deque()
         self.scene_t = -SCENE_COOLDOWN_S
         self.scene_thumbs, self.scene_id, self.scene_actions, self.exits = [], None, [], {}
         self.play_scenes, self.scene_entered_t = set(), 0.0
         self.display_ticks, self.ticking = deque(maxlen=10), False
-        self.variants = Counter()           # variant trials: kept / dropped
-        self.signal_t, self.seen_thumbs, self.box = -1, np.zeros((0, 256), np.float32), None
+        self.signal_t, self.recent_thumbs, self.box = -1, deque(), None
         self.novel_t = self.display_t = self.stuck_t = self.attempt_t = 0.0
-        self.recent = deque(maxlen=10)      # the model's last actions, as (tool, key) patterns
+        self.recent = deque(maxlen=10)        # the player's last actions, as (tool, key) patterns
         self.restart_t, self.restart_delays = None, []
+        self.variants, self.verdicts, self.stats = Counter(), Counter(), Counter()
+        self.first_scene_t = self.first_play_delay = None
+
+    def _view(self, t, **extra):
+        """A snapshot for a model role: copies, so threads never see memory change under them."""
+        m = self.memory
+        e = self.entry
+        return {'note': m['note'], 'fixes': list(m['fixes']), 'probes': list(m['probes']),
+                'lessons': list(m['lessons']), 'progress': list(m['progress']), 'log': list(m['log']),
+                'signals': m['signals'], 'library': self.library_text(t), 'writing': self.writing,
+                'playing': e and {'id': e['id'], 'desc': e['desc'], 'code': e['code'],
+                                  'seconds': t - self.controller_start, 'readings': list(e['readings'])},
+                'frames': [jpeg for _, jpeg in self.last_frames], 'attempts': list(self.attempts),
+                'scene': self.scene_id, **extra}
+
+    def library_text(self, t):
+        lines = []
+        for e in self.library:
+            if e['status'] in ('ok', 'running', 'stored') or e['status'].startswith('worse'):
+                read = e['readings']
+                lines.append(f"#{e['id']} [screen {e['scene']}] {e['desc']}: played {self.runtime(e, t):.0f} s, "
+                             + (f"progress read {read[0][1]:g} -> {read[-1][1]:g}, " if len(read) > 1 else '')
+                             + f"{self.rate(e, t):.0f} progress signals/min, {e['status']}")
+            else:
+                lines.append(f"#{e['id']} {e['desc']}: FAILED ({e['status']}: {e['reason'][:100]})")
+        return '\n'.join(lines[-12:]) or 'empty'
+
+    # --- the conductor ---
 
     def step(self, obs, tools):
         try:
@@ -111,7 +166,7 @@ class Agent:
         t = obs.elapsed_s
         if t < self.last_t:   # the clock started again: a new game
             self._reset()
-        self.last_t = t
+        self.last_t, self._obs = t, obs   # _obs: for jobs started deep inside the conductor
         image = Image.open(io.BytesIO(obs.image)).convert('RGB')
         self._check_scene(t, np.asarray(image), image)
         self._signals(t, image, obs.image)
@@ -122,21 +177,16 @@ class Agent:
         action = None
         if self.future and self.future.done():
             future, self.future = self.future, None
-            if self.future_scene != self.scene_id:   # decided for an earlier screen, e.g. Retry once play is back
-                self.events.append((t, f'dropped a reply decided on screen #{self.future_scene}'))
-            else:
-                try:
-                    action = self._apply(future.result(), t, image)
-                except Exception as e:   # bad model reply: tell the model on its next call
-                    self._wake(t, f'your last reply failed: {e!r}')
-        if self.variant and self.variant.done():
-            future, self.variant = self.variant, None
             try:
-                code = future.result()
-                if code and action is None and self.entry and not self.trial:
-                    action = self._start_trial(code, t, image)
-            except Exception as e:
-                self.events.append((t, f'variant failed: {e!r}'))
+                decision = future.result()
+                self._update(decision.pop('updates', None) or {}, t)
+                if self.future_scene != self.scene_id:   # decided for an earlier screen, e.g. Retry once play is back
+                    self.events.append((t, f'dropped a reply decided on screen #{self.future_scene}'))
+                else:
+                    action = self._apply(decision, t, image)
+            except Exception as e:   # bad model reply: tell the player on its next call
+                self._wake(t, f'your last reply failed: {e!r}')
+        self._collect(obs, t)
         if action is None and self.trial and t >= self.trial['end']:
             action = self._end_trial(t, image)
         if action is None and self.probes:
@@ -147,33 +197,164 @@ class Agent:
             action = self._run_controller(t, image)
         busy = self.controller or self.probes or self.queue or obs.program_left_s
         if not busy and self.future is None and not self.wake:
-            self._wake(t, 'ready')   # nothing is playing: ask for the next move
+            self._wake(t, 'ready')   # nothing is playing: ask the player for the next move
         if self.wake and self.future is None:
-            self.future = self.pool.submit(self.think, obs, self.wake, self.memory)
+            self.future = self.pool.submit(self.think, obs, self.wake, self._view(t))
             self.future_scene, self.wake = self.scene_id, None
-        e = self.entry
-        if (e and not self.trial and self.variant is None and self.runtime(e, t) >= VARY_AFTER_S
-                and t >= e.get('vary_t', 0)):
-            e['vary_t'] = t + 30
-            self.variant = self.variant_pool.submit(self.vary, obs, e, self.memory)
+        self._schedule(obs, t)
+        self._measure(t, action)
         return action or Action('skip')   # skip lets running inputs play on
 
     def _wake(self, t, event):
         self.events.append((t, event))
         self.wake = self.wake or event
 
-    # --- decisions ---
+    def _measure(self, t, action):
+        if any(j['key'] == 'writer' for j in self.jobs):   # how much play goes on while the writer works
+            self.stats['steps while writing'] += 1
+            self.stats['skips while writing'] += action is None
+        if self.first_scene_t is not None and self.first_play_delay is None and action is not None:
+            self.first_play_delay = round(t - self.first_scene_t, 1)
+
+    def _update(self, updates, t):
+        """Results a role reported about the game, merged here in the conductor."""
+        m = self.memory
+        if updates.get('log'):
+            m['log'] = (m['log'] + [updates['log']])[-20:]
+        if updates.get('progress'):
+            text, number = updates['progress']
+            m['progress'].append((t, text))
+            if number is not None and self.entry:   # the number read, to compare controllers by
+                self.entry['readings'].append((t, number))
+        if updates.get('note_fix'):
+            m['fixes'].append(updates['note_fix'])
+            if updates.get('display_box'):
+                m['display_box'], self.box = updates['display_box'], None
+
+    # --- background jobs ---
+
+    def _job(self, key, role, fn, obs, *args, **info):
+        """Start a background call unless one with this key still runs. The pool caps how many run at once."""
+        if any(j['key'] == key for j in self.jobs):
+            return False
+        t = obs.elapsed_s
+        future = self.background.submit(fn, obs, *args, self._view(t))
+        self.jobs.append({'key': key, 'role': role, 'scene': self.scene_id, 'future': future, 't': t, **info})
+        return True
+
+    def _schedule(self, obs, t):
+        m = self.memory
+        if m['note'] is None and 'start' not in self.notes_done:
+            self.notes_done.add('start')
+            self._job('analyst:note', 'analyst', self.analyse, obs, 'note', why='start')
+        if t >= NOTE_RECHECK_S and 'time' not in self.notes_done:
+            self.notes_done.add('time')
+            self.notes_due.append('time')
+        if self.notes_due and m['note'] is not None and self._job('analyst:note', 'analyst', self.analyse, obs, 'note',
+                                                                    why=self.notes_due[0]):
+            self.notes_due.pop(0)
+        e = self.entry
+        if e and not self.trial and t - self.controller_t >= CHECK_S and self._job(
+                'checker', 'checker', self.check, obs, entry=e['id']):
+            self.controller_t = t
+        if (e and not self.trial and self.runtime(e, t) >= VARY_AFTER_S and t >= e.get('vary_t', 0)
+                and self._job('variant', 'variant', self.vary, obs, {'id': e['id'], 'desc': e['desc'], 'code': e['code']},
+                              entry=e['id'])):
+            e['vary_t'] = t + 30
+
+    def _collect(self, obs, t):
+        for job in [j for j in self.jobs if j['future'].done()]:
+            self.jobs.remove(job)
+            try:
+                result = job['future'].result()
+            except Exception as e:
+                self.events.append((t, f"{job['role']} failed: {e!r}"))
+                if job['key'] == 'writer':
+                    self.writing = None
+                continue
+            here = job['scene'] == self.scene_id
+            try:
+                getattr(self, '_got_' + job['key'].replace(':', '_'))(job, result, here, obs, t)
+            except Exception as e:
+                self.events.append((t, f"{job['role']} result failed: {e!r}"))
+
+    def _got_writer(self, job, code, here, obs, t):
+        goal, self.writing = self.writing, None
+        if not code:
+            return
+        try:
+            entry = self._new_entry(code, t, scene=job['scene'], goal=goal)
+        except Exception as e:
+            self._wake(t, f'the controller written for "{goal}" failed to load: {e!r}')
+            return
+        if here and not self.trial:
+            self._start(entry, t)
+            self.events.append((t, f"writer's #{entry['id']} for \"{goal}\" started"))
+        else:   # meant for another screen, or a trial runs: keep it for later
+            entry['status'] = 'stored'
+            self.events.append((t, f"writer's #{entry['id']} stored (written for screen #{job['scene']})"))
+
+    def _got_variant(self, job, code, here, obs, t):
+        if not code:
+            return
+        if here and self.entry and self.entry['id'] == job['entry'] and not self.trial:
+            self._start_trial(code, t)
+        else:
+            entry = self._new_entry(code, t, scene=job['scene'], parent=job['entry'])
+            entry['status'] = 'stored'
+
+    def _got_checker(self, job, verdict, here, obs, t):
+        if not verdict:
+            return
+        entry = next((e for e in self.library if e['id'] == job['entry']), None)
+        trend = 'unknown'
+        if entry is not None:
+            if verdict.get('reading') is not None:
+                entry['readings'].append((t, verdict['reading']))
+            read = [v for _, v in entry['readings']]
+            trend = 'unknown' if len(read) < 2 else 'rising' if read[-1] > read[-2] else 'flat or falling'
+        kind = verdict.get('verdict', 'KEEP')
+        self.verdicts[f'{kind} when {trend}'] += 1
+        self.events.append((t, f"checker on #{job['entry']}: {kind} ({verdict.get('reason', '')[:80]})"))
+        if kind == 'REPLACE' and self.entry is entry and self.writing is None:
+            self.writing = f"replace #{job['entry']}: {verdict.get('reason', '')}"
+            self._job('writer', 'writer', self.write, obs, self.writing)
+
+    def _got_analyst_note(self, job, result, here, obs, t):
+        if not result:
+            return
+        self.memory['note'], self.memory['fixes'] = result['note'], []
+        self.memory['display_box'], self.box = result.get('display_box'), None
+        self.events.append((t, f"analyst wrote the note ({job['why']})"))
+        if job['why'] != 'start' and not self.probed:   # the game itself runs now: plan the control check
+            self.probed = True
+            self._job('analyst:probe', 'analyst', self.analyse, obs, 'probe')
+
+    def _got_analyst_probe(self, job, result, here, obs, t):
+        if result and here and len(result.get('probe', [])) > 1:
+            self._stop(t, 'ok', 'paused for the control check')
+            self.probes = [{'label': label, 'action': action and Action(action['tool'], action.get('params') or {})}
+                           for label, action in result['probe']]
+            self.queue, self.memory['probes'] = [], []
+
+    def _got_analyst_lesson(self, job, result, here, obs, t):
+        if result and result.get('lesson'):
+            self.memory['lessons'].append(result['lesson'])
+
+    # --- the player's decisions ---
 
     def _apply(self, decision, t, image):
         if decision.get('keep'):
             return None
+        if 'write' in decision:
+            if self.writing is None:
+                self.writing = decision['write']
+                self._job('writer', 'writer', self.write, self._obs, self.writing)
+                self.events.append((t, f'writer asked: {self.writing[:80]}'))
+            return None
         if 'probe' in decision:
-            self._stop(t, 'ok', 'replaced by a control check')
-            self.probes = [{'label': label, 'action': action and Action(action['tool'], action.get('params') or {})}
-                           for label, action in decision['probe']]
-            self.queue = []
-            self.memory['probes'] = []
-            return self._probe(t, image)
+            self._got_analyst_probe(None, decision, True, None, t)
+            return self._probe(t, image) if self.probes else None
         if 'reuse' in decision:
             entry = next((e for e in self.library if e['id'] == decision['reuse'] and 'fn' in e), None)
             if entry is None:
@@ -192,9 +373,10 @@ class Agent:
 
     # --- controllers and their library ---
 
-    def _new_entry(self, code, t, parent=None):
+    def _new_entry(self, code, t, scene=None, parent=None, goal=None):
         first = code.strip().splitlines()[0] if code.strip() else ''
-        entry = {'id': len(self.library) + 1, 'scene': self.scene_id, 'code': code, 'parent': parent,
+        entry = {'id': len(self.library) + 1, 'scene': self.scene_id if scene is None else scene, 'code': code,
+                 'parent': parent, 'goal': goal,
                  'desc': first.lstrip('#').replace('skill:', '').strip() if first.startswith('#') else first[:60],
                  'runtime': 0.0, 'events': 0, 'signal_t': [], 'readings': [], 'status': 'new', 'reason': ''}
         self.library.append(entry)
@@ -216,7 +398,7 @@ class Agent:
 
     @staticmethod
     def gain(entry):
-        """Per minute, how the progress number the model read changed while it played (0 without two readings)."""
+        """Per minute, how the progress number read changed while it played (0 without two readings)."""
         (t0, v0), (t1, v1) = (entry['readings'][0], entry['readings'][-1]) if len(entry['readings']) > 1 else ((0, 0), (1, 0))
         return (v1 - v0) * 60 / max(t1 - t0, 1)
 
@@ -269,29 +451,22 @@ class Agent:
         if self.restart_t is not None:   # measures how fast play resumes after a game over
             self.restart_delays.append(round(t - self.restart_t, 1))
             self.restart_t = None
-        if t - self.controller_t >= CHECK_S and not self.trial:
-            self.controller_t = t   # it keeps playing while the model looks
-            self._wake(t, f'check-in: your controller has played for {t - self.controller_start:.0f} s and plays on '
-                          'while you look. Is it making progress on what counts (your game note)? '
-                          'KEEP it, or reply with a better controller or an action')
         return Action(choice['tool'], choice.get('params') or {})
 
-    def _start_trial(self, code, t, image):
+    def _start_trial(self, code, t):
         parent = self.entry
         entry = self._new_entry(code, t, parent=parent['id'])
         self._start(entry, t)
         parent['status'] = 'ok'   # paused, not failed
         self.trial = {'entry': entry, 'parent': parent, 'start': t, 'end': t + TRIAL_S}
         self.events.append((t, f"trying variant #{entry['id']} of #{parent['id']}"))
-        return self._run_controller(t, image)
 
     def _end_trial(self, t, image):
         trial, self.trial = self.trial, None
         variant, parent = trial['entry'], trial['parent']
         if self.entry is not variant:   # it was stopped or replaced meanwhile
             return None
-        # the parent's last TRIAL_S before the trial against the variant's TRIAL_S: new screen content gets
-        # rarer as a game goes on, so a lifetime average would favour the parent
+        # the parent's last TRIAL_S before the trial against the variant's TRIAL_S, not a lifetime average
         start = trial['start']
         ours = sum(s >= start for s in variant['signal_t'])
         theirs = sum(start - TRIAL_S <= s < start for s in parent['signal_t'])
@@ -338,11 +513,12 @@ class Agent:
         self.last_frames.append((t, jpeg))
         progress = False
         small = thumb(image)
-        if not len(self.seen_thumbs) or np.abs(self.seen_thumbs - small).mean(axis=1).min() > NOVEL_DIFF:
+        while self.recent_thumbs and self.recent_thumbs[0][0] < t - NOVEL_WINDOW_S:
+            self.recent_thumbs.popleft()
+        if not self.recent_thumbs or min(np.abs(th - small).mean() for _, th in self.recent_thumbs) > NOVEL_DIFF:
             self.novel_t, progress = t, True
-            if len(self.seen_thumbs) < 3000:
-                self.seen_thumbs = np.vstack([self.seen_thumbs, small])
-        box = self.memory.get('display_box')   # the progress display the model located, grid x0, y0, x1, y1
+        self.recent_thumbs.append((t, small))
+        box = self.memory.get('display_box')   # the progress display the analyst located, grid x0, y0, x1, y1
         if box:
             px = to_pixels({'x': box[0], 'y': box[1], 'x2': box[2], 'y2': box[3]}, *image.size)
             crop = np.asarray(image.convert('L').crop((px['x'], px['y'], px['x2'] + 1, px['y2'] + 1))
@@ -403,6 +579,9 @@ class Agent:
         new, known = self._scene_of(thumb(image))
         if new == old:
             return
+        if self.first_scene_t is None:
+            self.first_scene_t = t
+            self.notes_due.append('scene')    # the game itself likely shows now: revise the note
         played = old in self.play_scenes or t - self.scene_entered_t >= PLAY_S
         if played:
             self.play_scenes.add(old)
@@ -418,10 +597,10 @@ class Agent:
             self.attempts.append(ended)
             self.restart_t = t
             self.queue, self.queue_t = list(self.exits.get(new, [])), t + REPLAY_GAP_S
+            self._job('analyst:lesson', 'analyst', self.analyse, self._obs, 'lesson')
             self._wake(t, f'game over or next level: play screen #{old} gave way to screen #{new} after {ended:.0f} s'
                           + (f'; replaying the {len(self.queue)} actions that led off this screen last time'
-                             if self.queue else '')
-                          + '. If the run ended: what ended it, and what do you change?')
+                             if self.queue else ''))
             return
         best = self._best(new, t)
         if best:
