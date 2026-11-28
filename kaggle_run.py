@@ -63,7 +63,7 @@ def fetch(version):
     r = api.list_kernel_session_output(request(ApiListKernelSessionOutputRequest, user_name=USER, kernel_slug=SLUG))
     (out / 'log.txt').write_text(r.log or '')
     for f in r.files:
-        if f.file_name.endswith(('.txt', '.parquet', '.json', '.py')):   # recordings are big; open them on Kaggle
+        if f.file_name.endswith(('.txt', '.parquet', '.json', '.py', '.webm')):
             urllib.request.urlretrieve(f.url, out / f.file_name)
     print(f'output in {out}: {sorted(p.name for p in out.iterdir())}')
 
