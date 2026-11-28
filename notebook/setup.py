@@ -31,6 +31,8 @@ subprocess.Popen(['Xvfb', ':99', '-screen', '0', '1920x1080x24'], stdout=subproc
 sys.path.insert(0, str(harness))
 sys.path.insert(0, '/kaggle/working')   # for autopilot.py, written by the next cell
 os.environ.update(GGA_ROOT=str(harness), GGA_SEED='0', DISPLAY=':99', PLAYWRIGHT_BROWSERS_PATH='/tmp/browsers')
+# FlashInfer's sampler compiles at startup and fails to link (-lcuda missing); greedy needs no sampler anyway
+os.environ['VLLM_USE_FLASHINFER_SAMPLER'] = '0'
 list(reading)   # raises if a read failed
 os.close(fd)
 log('read the weights')
