@@ -44,12 +44,13 @@ class FakeModel(Agent):
         return self.replies.pop(0) if self.replies else {'tool': 'skip', 'params': {}}
 
 
-def obs(t, red_x=30, color=(0, 0, 0)):
+def obs(t, red_x=30, color=(0, 0, 0), program_left_s=0.0, last_action=None):
     img = Image.new('RGB', (64, 48), color)
     img.paste((255, 0, 0), (red_x, 0, red_x + 1, 48))
     buf = io.BytesIO()
     img.save(buf, 'JPEG', quality=95)
-    return types.SimpleNamespace(elapsed_s=t, image=buf.getvalue())
+    return types.SimpleNamespace(elapsed_s=t, image=buf.getvalue(), program_left_s=program_left_s,
+                                 last_action=last_action or {})
 
 
 def play(agent, seconds, start=0.0, **kw):
@@ -72,7 +73,8 @@ assert agent.seen[:3] == ['new game', 'done dodging', 'controller crashed: ZeroD
 
 # 2. A sequence keeps the model asleep until it has played out.
 agent = FakeModel([{'tool': 'sequence', 'params': {'steps': [{'keys': ['a'], 'duration_ms': 1500}]}}])
-play(agent, 1.6)
+play(agent, 0.4)
+play(agent, 1.2, start=0.4, program_left_s=1.0)   # the game reports the sequence still playing
 assert agent.seen == ['new game'], agent.seen
 
 # 3. A new game (clock back near 0) resets per-game state and wakes the model.
@@ -88,7 +90,13 @@ assert agent.controller is None and 'the scene changed' in agent.seen, agent.see
 
 print('ok')
 
-# 5. Parsing Gemma's replies.
+# 5. A refused controller action stops the controller and tells the model why.
+agent = FakeModel([{'controller': 'def control(frame, mem): return {"tool": "click", "params": {"x": 1, "y": 1}}'}])
+play(agent, 0.6)
+play(agent, 0.4, start=0.6, last_action={'tool': 'click', 'ok': False, 'error': 'x out of range'})
+assert agent.controller is None and "the game refused the controller's action: x out of range" in agent.seen, agent.seen
+
+# 6. Parsing Gemma's replies.
 from gemma import parse  # noqa: E402
 
 assert parse('{"tool":"click","params":{"x":999,"y":0}}', 641, 481) == {'tool': 'click', 'params': {'x': 640, 'y': 0}}

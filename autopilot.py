@@ -39,7 +39,6 @@ class Agent:
         self.future = None   # shortcut: a think still running from the last game delays this game's first one
         self.memory = {}     # per game, for the model's notes
         self.controller = None
-        self.busy_until = 0  # game time until which a sequence is still playing
         self.wake = 'new game'
         self.scenes = deque()
         self.scene_t = -SCENE_COOLDOWN_S
@@ -52,6 +51,9 @@ class Agent:
         self.last_t = t
         frame = np.asarray(Image.open(io.BytesIO(obs.image)).convert('RGB'))
         self._check_scene(t, frame)
+        if self.controller and obs.last_action.get('ok') is False:   # the game refused its last action
+            self.controller = None
+            self._wake(t, f"the game refused the controller's action: {obs.last_action.get('error')}")
 
         action = None
         if self.future and self.future.done():
@@ -62,7 +64,7 @@ class Agent:
                 self._wake(t, f'your last reply failed: {e!r}')
         if action is None and self.controller:
             action = self._run_controller(t, frame)
-        if self.controller is None and self.future is None and t >= self.busy_until and not self.wake:
+        if self.controller is None and self.future is None and not obs.program_left_s and not self.wake:
             self._wake(t, 'ready')   # nothing is playing: ask for the next move
         if self.wake and self.future is None:
             self.future = self.pool.submit(self.think, obs, self.wake, self.memory)
@@ -80,8 +82,6 @@ class Agent:
             self.controller, self.controller_mem, self.controller_t = namespace['control'], {}, t
             return self._run_controller(t, frame)
         self.controller = None
-        steps = decision.get('params', {}).get('steps', []) if decision['tool'] == 'sequence' else []
-        self.busy_until = t + sum(s.get('duration_ms', 0) for s in steps) / 1000
         return Action(decision['tool'], decision.get('params', {}))
 
     def _run_controller(self, t, frame):
