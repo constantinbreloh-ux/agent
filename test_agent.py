@@ -36,13 +36,18 @@ def control(frame, mem):
 
 class FakeModel(Agent):
     def __init__(self, replies):
-        self.replies, self.seen = list(replies), []
+        self.replies, self.seen = (replies if callable(replies) else list(replies)), []
         super().__init__()
 
     def think(self, obs, event, memory):
         self.seen.append(event)
         time.sleep(0.3)   # a slow model
+        if callable(self.replies):
+            return self.replies(self, event)
         return self.replies.pop(0) if self.replies else {'tool': 'skip', 'params': {}}
+
+    def vary(self, obs, entry, memory):
+        return getattr(self, 'variant_code', None)
 
 
 def obs(t, red_x=30, color=(0, 0, 0), program_left_s=0.0, last_action=None):
@@ -81,13 +86,13 @@ assert agent.seen == ['new game'], agent.seen
 # 3. A new game (clock back near 0) resets per-game state and wakes the model.
 agent.memory['note'] = 'old game'
 play(agent, 0.4, start=0.0)
-assert agent.memory == {} and agent.seen[-1] == 'new game', (agent.memory, agent.seen)
+assert 'note' not in agent.memory and agent.library == [] and agent.seen[-1] == 'new game', (agent.memory, agent.seen)
 
 # 4. A lasting scene change stops the controller and wakes the model.
 agent = FakeModel([{'controller': 'def control(frame, mem): return {"tool": "skip"}'}])
 play(agent, 1.4)
 play(agent, 1.6, start=1.4, color=(200, 200, 200))
-assert agent.controller is None and 'the scene changed' in agent.seen, agent.seen
+assert agent.controller is None and any(e.startswith('the scene changed (screen #1, new)') for e in agent.seen), agent.seen
 
 print('ok')
 
@@ -131,7 +136,7 @@ gemma.SERVER = f'http://127.0.0.1:{server.server_port}/v1/chat/completions'
 agent = gemma.Agent()
 o = obs(1.0)
 o.info = {'description': 'd', 'controls': 'c', 'width': 64, 'height': 48, 'remaining_s': 9}
-assert agent.think(o, 'ready', {}) == {'tool': 'click', 'params': {'x': 0, 'y': 47}}
+assert agent.think(o, 'ready', agent.memory) == {'tool': 'click', 'params': {'x': 0, 'y': 47}}
 user = FakeServer.body['messages'][1]['content']
 assert user[0]['image_url']['url'].startswith('data:image/jpeg;base64,') and 'ready' in user[1]['text'], user
 assert agent.replies[-1][4] == 20 and agent.replies[0][1] == 'game note', agent.replies
@@ -144,7 +149,7 @@ agent = FakeModel([{'controller': 'def control(frame, mem): return {"tool": "hol
                    {'keep': True}])
 actions = play(agent, 2.6)
 assert any(e.startswith('check-in: your controller has played for') for e in agent.seen), agent.seen
-assert agent.controller is not None and agent.controller_code.startswith('def control'), agent.seen
+assert agent.controller is not None and agent.entry['code'].startswith('def control'), agent.seen
 held = [a for a in actions if a.tool == 'hold_keys']
 assert len(held) >= 10 and all(a.params['keys'] == ['a'] for a in held), actions   # played on, empty key dropped
 autopilot.CHECK_S = 10
@@ -152,3 +157,77 @@ assert gemma.parse('Progress: alive, 3 lives\nKEEP', 1, 1) == {'keep': True}
 print('check-in ok')
 assert gemma.parse('{"tool":"drag","params":{"x":0,"y":0,"x2":999,"y2":999}}', 641, 481)['params'] == {'x': 0, 'y': 0, 'x2': 640, 'y2': 480}
 print('drag ok')
+
+# 9. Game over: back on a screen left before -> replay the actions that left it, then restart the best controller.
+autopilot.BEST_MIN_S = 0.5
+MOVE = '# skill: hold the pointer mid-screen\ndef control(frame, mem): return {"tool": "move", "params": {"x": 500, "y": 500}}'
+def policy(agent, event):
+    if agent.scene_id == 0:
+        return {'tool': 'click', 'params': {'x': 3, 'y': 3}}
+    return {'keep': True} if agent.library else {'controller': MOVE}
+agent = FakeModel(policy)
+play(agent, 1.6)
+play(agent, 2.8, start=1.6, color=(200, 200, 200))
+assert agent.entry and agent.entry['desc'] == 'hold the pointer mid-screen', agent.events
+agent.library[0]['events'] = 3   # stand-in for progress signals while it played
+actions = play(agent, 2.2, start=4.4)
+assert any(e.startswith('game over: back on screen #0') for _, e in agent.events), agent.events
+assert agent.attempts and agent.library[0]['status'] == 'ok', (agent.attempts, agent.library)
+play(agent, 2.0, start=6.6, color=(200, 200, 200))
+assert any('your best controller for it, #1, is playing again' in e for _, e in agent.events), agent.events
+assert agent.entry is agent.library[0] and agent.restart_delays, (agent.entry, agent.restart_delays)
+print('game over ok')
+
+# 10. No progress: a static screen and repeated actions wake the model with the measurements.
+autopilot.STUCK_S = 2
+agent = FakeModel(lambda agent, event: {'tool': 'click', 'params': {'x': 3, 'y': 3}})
+play(agent, 5.0)
+stuck = [e for _, e in agent.events if e.startswith('no progress signal')]
+assert stuck and 'of your last 10 actions were click' in stuck[-1] and 'no progress display located' in stuck[-1], agent.events
+autopilot.STUCK_S = 15
+print('stuck ok')
+
+# 11. Control check: each action once, the screen watched, the results for the model.
+agent = FakeModel([{'probe': [('no input', None), ('Q', {'tool': 'press_key', 'params': {'key': 'q'}})]}])
+actions = play(agent, 2.6)
+assert any(a.tool == 'press_key' for a in actions), actions
+assert agent.memory['probes'] == ['no input: nothing visible changed', 'Q: nothing visible changed'], agent.memory
+assert 'control check done: see its results' in agent.seen, agent.seen
+print('probe ok')
+
+# 12. A variant that makes no more progress than its parent is dropped, and the parent plays again.
+autopilot.VARY_AFTER_S, autopilot.TRIAL_S = 0.6, 0.6
+agent = FakeModel([{'controller': MOVE}])
+agent.variant_code = '# skill: the same, a bit left\ndef control(frame, mem): return {"tool": "move", "params": {"x": 400, "y": 500}}'
+play(agent, 2.6)
+texts = [e for _, e in agent.events]
+assert 'trying variant #2 of #1' in texts and 'variant #2 is not better than #1: back to #1' in texts, texts
+assert agent.entry is agent.library[0] and agent.library[1]['status'] == 'worse than #1', agent.library
+autopilot.VARY_AFTER_S, autopilot.TRIAL_S = 20, 15
+print('variant ok')
+
+# 13. step() never raises.
+agent = Agent()
+bad = obs(0.0)
+bad.image = b'not a jpeg'
+assert agent.step(bad, []).tool == 'skip' and agent.events[-1][1].startswith('agent error'), agent.events
+print('no raise ok')
+
+# 14. Gemma side: REUSE, control-check lines, the progress display box, game-over images.
+assert gemma.parse('Progress: alive\nREUSE #3', 1, 1) == {'reuse': 3}
+probes = gemma.parse_probe('Q (build): {"tool":"press_key","params":{"key":"q"}}\nleft click: {"tool":"click","params":{"x":999,"y":0}}\nnonsense', 641, 481)
+assert [p[0] for p in probes] == ['no input (the screen alone)', 'Q (build)', 'left click'] and probes[2][1]['params']['x'] == 640, probes
+assert gemma.display_box('Progress display: 0,930,999,999') == (0, 930, 999, 999)
+assert gemma.display_box('Progress display: none\nCorrection: Progress display: (10, 900, 300, 990)') == (10, 900, 300, 990)
+assert gemma.display_box('Progress display: none') is None
+agent = gemma.Agent()
+o = obs(5.0)
+o.info = {'description': 'd', 'controls': 'c', 'width': 64, 'height': 48, 'remaining_s': 9}
+agent.memory['last_frames'].extend([(i, o.image) for i in range(8)])
+agent.think(o, 'game over: back on screen #0 after 40 s', agent.memory)
+content = FakeServer.body['messages'][1]['content']
+assert [c['type'] for c in content] == ['image_url'] * 6 + ['text'] and 'last seconds before the game over' in content[-1]['text'], content
+o.elapsed_s = 25.0
+agent.think(o, 'ready', agent.memory)   # 20 s: the note is revised, a control check planned
+assert agent.memory['note_at_20s'] and agent.memory['probed'], agent.memory.keys()
+print('gemma ok')

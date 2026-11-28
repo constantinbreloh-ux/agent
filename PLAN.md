@@ -63,3 +63,13 @@ und lädt Log + `replies.txt` nach `runs/<version>/`. Der Kaggle-Token liegt im 
 6. **Prompt**: Regeln aus dem Paper („Prefer sequence when it is enough“, „Test an uncertain control
    briefly before you rely on it“), Notizen pro Spiel.
 7. **Kaggle-Notebook**: Abgabe, 4 Beispielspiele lokal messen, dann submitten (~6 h bis Score).
+
+## Stand nach Lauf 8: Brainstorming-Plan, Schritte 1–4 (ungetestet auf Kaggle)
+
+1. Spiel-Notiz: 6 Zeilen (Typ, Ziel, Steuerung, Anzeige-Box auf 0–999, was zählt, Strategie); neu geschrieben beim
+   ersten Szenenwechsel und nach 20 s; Korrekturen per `Note:`-Zeile.
+2. Steuerungs-Check: Gemma plant je Steuerung eine Testaktion, der Agent führt sie aus und misst, was sich ändert.
+3. Bildsignale jede Sekunde (neuer Inhalt, Anzeige-Box, Wiederholung, Versuche); 15 s ohne Signal → Gemma wecken.
+   Game Over = Rückkehr auf einen Bildschirm, den Gemma schon einmal verlassen hat → Bilder der letzten Sekunden + `Lesson:`.
+4. Controller-Library pro Spiel; nach Game Over Replay der Ausstiegsaktionen und Neustart des besten Controllers;
+   Varianten parallel, behalten nur bei > 1,2× Fortschrittssignalen/min.

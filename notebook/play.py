@@ -1,69 +1,70 @@
-# Plays one sample game here, live, and shows what the agent does. Change the three settings and rerun this cell.
-import queue
+# Plays the sample games here, one Agent for all as in the competition, and prints a measurement row per game.
+import statistics
 from collections import Counter
 from IPython.display import HTML, Image as Frame, display
 from gga.game import Game
 
-GAME = 'cavebots'             # asteroid_capitalist, blarglike, cavebots or off_line
-PLAY_SECONDS = 120             # in the competition a game runs for 10 minutes
-AGENT_VIEW = False             # False: the live game, every frame; True: only the screenshots the agent sees
+GAMES = ['asteroid_capitalist', 'blarglike', 'cavebots', 'off_line']
+PLAY_SECONDS = 120             # per game; in the competition a game runs for 10 minutes
 
 # The competition's run skips this: the server in the last cell must be up within 15 minutes.
 if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
-    game = Game(GAME, video_dir='/kaggle/working')   # also saves a recording to the output files
-    game.initialize({'minutes': PLAY_SECONDS / 60})
-    tools = game.tools()
+    specs = json.load(open(harness / 'games.json'))['games']
     agent = Agent()
     Agent.replies.clear()
-
     screen = display(HTML('<i>Starting...</i>'), display_id=True)
     status = display(HTML(''), display_id=True)
-    live = queue.Queue()   # each turn: (when it came, its frames as (elapsed_s, jpeg)); None ends play_live
-
-    def play_live():
-        shown = last = None
-        while (turn := live.get()) is not None:
-            at, batch = turn
-            step = (at - last) / len(batch) if last else 0.05
-            last, start = at, time.time()
-            for i, (elapsed, jpeg) in enumerate(batch, 1):
-                if shown is None or elapsed > shown:
-                    screen.update(Frame(data=jpeg, width=800))
-                    shown = elapsed
-                if not live.qsize():
-                    time.sleep(max(0, start + i * step - time.time()))
-
-    player = threading.Thread(target=play_live)
-    player.start()
-
-    turns, refused, step_s, tools_used = 0, [], [], Counter()
-    while not game.is_terminal():
-        obs = game.get_observation()
-        if AGENT_VIEW:
-            screen.update(Frame(data=obs.image, width=800))
-        else:
-            live.put((time.time(), obs.history + obs.frames))
-        began = time.time()
-        action = agent.step(obs, tools)
-        step_s.append(time.time() - began)
-        result = game.handle_tool(action.tool, action.params)
-        turns += 1
-        tools_used[('controller: ' if agent.controller else '') + action.tool] += 1
-        if not result['ok'] and not game.is_terminal():
-            refused.append(result.get('error'))
-        last_event = agent.events[-1] if agent.events else ''
-        status.update(HTML(f'Turn {turns}, game time {obs.elapsed_s:.0f} s, '
-                           f'controller {"on" if agent.controller else "off"}, last event: <code>{last_event}</code>'))
-
-    game.stop()
-    live.put(None)
-    player.join()
-    print(f'{turns} turns, step() max {max(step_s) * 1000:.0f} ms, {len(Agent.replies)} Gemma replies, '
-          f'{len(refused)} refused {refused[:3]}')
-    print('Actions:', dict(tools_used))
-    print('Events:', agent.events)
-    with open('/kaggle/working/replies.txt', 'w') as f:   # every Gemma reply, to read after the run
-        for elapsed, event, reply, secs, tokens in Agent.replies:
-            f.write(f'=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens)\n{reply}\n\n')
-    for elapsed, event, reply, secs, tokens in Agent.replies[-3:]:
-        print(f'\n=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens)\n{reply}')
+    sheet = []
+    log = open('/kaggle/working/replies.txt', 'w')   # every Gemma reply, to read after the run
+    for name in GAMES:
+        game = Game(name, video_dir=f'/kaggle/working/video_{name}')
+        game.initialize({'minutes': PLAY_SECONDS / 60})
+        tools = game.tools()
+        first_reply = len(Agent.replies)
+        turns, refused, step_s, tools_used = 0, [], [], Counter()
+        while not game.is_terminal():
+            obs = game.get_observation()
+            began = time.time()
+            action = agent.step(obs, tools)
+            step_s.append(time.time() - began)
+            result = game.handle_tool(action.tool, action.params)
+            turns += 1
+            tools_used[('controller: ' if agent.controller else '') + action.tool] += 1
+            if not result['ok'] and not game.is_terminal():
+                refused.append(result.get('error'))
+            if turns % 5 == 0:
+                screen.update(Frame(data=obs.image, width=640))
+                status.update(HTML(f'{name}: {obs.elapsed_s:.0f} s, controller {"on" if agent.controller else "off"}, '
+                                   f'last event: <code>{agent.events[-1][1][:120] if agent.events else ""}</code>'))
+        game.stop()
+        score = game.get_score()   # local runs only: the game's own counter, normalized 0..1 like the leaderboard
+        replies = Agent.replies[first_reply:]
+        writes = [r for r in replies if '```python' in r[2]]
+        stuck = [(round(t), e[:60]) for t, e in agent.events if e.startswith('no progress')]
+        row = {
+            'game': name, 'metric': specs[name]['scoring']['metric'], 'score': score,
+            'skip share': round(tools_used['skip'] / max(turns, 1), 2), 'refused': len(refused), 'refusals': refused[:3],
+            'step max ms': round(max(step_s) * 1000),
+            'replies': len(replies), 'reply s median': round(statistics.median(r[3] for r in replies), 1) if replies else None,
+            'tokens median': statistics.median(r[4] for r in replies) if replies else None,
+            'controller writes/min': round(len(writes) / (PLAY_SECONDS / 60), 1),
+            'attempts': len(agent.attempts) + 1, 'attempt s': [round(a) for a in agent.attempts],
+            'restart → controller s': agent.restart_delays, 'no-progress wakes': stuck,
+            'library': [(e['id'], e['desc'][:40], e['status'], round(agent.rate(e, obs.elapsed_s)))
+                        for e in agent.library],
+            'probes': agent.memory.get('probes'), 'note': agent.memory.get('note'),
+            'lessons': agent.memory.get('lessons'), 'actions': dict(tools_used),
+        }
+        sheet.append(row)
+        print(json.dumps(row, indent=1, ensure_ascii=False))
+        print('Events:', [(round(t, 1), e[:100]) for t, e in agent.events])
+        log.write(f'##### {name}\n')
+        for elapsed, event, reply, secs, tokens in replies:
+            log.write(f'=== {elapsed:.1f} s, {event} ({secs:.1f} s, {tokens} tokens)\n{reply}\n\n')
+    log.close()
+    json.dump(sheet, open('/kaggle/working/sheet.json', 'w'), indent=1, ensure_ascii=False, default=str)
+    print('\nMeasurement sheet')
+    for row in sheet:
+        print(f"{row['game']:20} score {row['score']}  skip {row['skip share']}  refused {row['refused']}  "
+              f"reply {row['reply s median']} s / {row['tokens median']} tok  writes/min {row['controller writes/min']}  "
+              f"attempts {row['attempts']}  no-progress {len(row['no-progress wakes'])}  restart {row['restart → controller s']}")

@@ -79,8 +79,9 @@ def fetch(version, slug=SLUG):
     (out / 'log.txt').write_text(r.log or '')
     for f in r.files:
         if f.file_name.endswith(('.txt', '.parquet', '.json', '.py', '.webm', '.log')):
+            (out / f.file_name).parent.mkdir(parents=True, exist_ok=True)   # videos sit in one folder per game
             urllib.request.urlretrieve(f.url, out / f.file_name)
-    print(f'output in {out}: {sorted(p.name for p in out.iterdir())}')
+    print(f'output in {out}: {sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_file())}')
 
 
 if __name__ == '__main__':
