@@ -47,8 +47,9 @@ step(obs) ──► Frame in Puffer legen, Wake-Events prüfen
 ## Arbeitsweise
 
 Gemma (62 GB) läuft nur auf Kaggle. Hier wird nur der modellfreie Teil getestet (`python test_agent.py`).
-`python make_notebook.py` baut aus den Repo-Dateien `gga_autopilot.ipynb`; das wird in Kaggle importiert
-(File → Import Notebook), ausgeführt, und `replies.txt` + die Ausgabe der Play-Zelle kommen zurück.
+`python kaggle_run.py` baut `gga_autopilot.ipynb`, lädt es als neue Version des privaten Kaggle-Notebooks
+`constantinbreloh/gga-autopilot` hoch (Inputs, GPU und Image kopiert vom Gemma-Starter), wartet auf den Lauf
+und lädt Log + `replies.txt` nach `runs/<version>/`. Der Kaggle-Token liegt im Session-Proxy, nicht im Repo.
 
 ## Schritte
 
