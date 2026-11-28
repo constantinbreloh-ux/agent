@@ -15,7 +15,8 @@ SERVER = 'http://localhost:8000/v1/chat/completions'
 RULES = '''You play a real-time browser game from screenshots. The game keeps running while you think, and each
 of your replies takes seconds, so prefer moves that keep playing on their own.
 
-Reply in exactly one of these two forms.
+Start every reply with one line: Score: <the score, points, money or other progress number on screen, or none>
+Then reply in exactly one of these three forms.
 
 1. One action as JSON on one line. Coordinates are on a 0-999 grid over the image (x: left to right,
    y: top to bottom):
@@ -32,15 +33,22 @@ Reply in exactly one of these two forms.
 def control(frame, mem):
     # frame: numpy uint8 array (H, W, 3), RGB, the full game screen; W and H are given below. np is numpy.
     # mem: a dict kept between calls.
-    # Return one action dict in the frame's own pixel coordinates (never convert to the 0-999 grid),
-    # same tools as above, e.g.
-    #   {"tool": "press_key", "params": {"key": "ArrowLeft"}}
-    # or set mem["handoff"] = "<why>" and return None to give control back to you.
+    # Return one action dict (same tools as above), or set mem["handoff"] = "<why>" and return None
+    # to give control back to you.
     ...
 ```
-   Keep control() fast, well under 0.1 s: find things by color with numpy masks, never loop over pixels.
-   Write it short, with no comments: every line you write costs game time while the game runs on.
-   Give control back when something happens it cannot handle.
+   Rules for controllers:
+   - Coordinates are frame pixels, exactly as numpy gives them. np.argwhere returns (y, x) rows.
+     Never scale them: no "x * 1000 / w", no 0-999 grid inside a controller.
+   - Act on what you detect: aim at the targets you found, move away from the threats you found.
+     Code that finds things and then ignores them is useless.
+   - No comments, no docstrings, no blank lines: every token you write costs game time.
+   - Fast, well under 0.1 s per call: numpy color masks, never Python loops over pixels.
+   - Give control back when something happens it cannot handle.
+
+3. KEEP
+   Only while your controller is playing and the score shows it works: it plays on unchanged.
+   If the score is not rising, reply with a better controller instead.
 
 Prefer a sequence when it is enough. Test an uncertain control briefly with one action before you rely on it.
 If a menu or game-over screen shows, start the game the way the brief or the screen says.
@@ -56,13 +64,15 @@ def to_pixels(params, width, height):
 
 
 def parse(reply, width, height):
-    """Gemma's reply -> {'controller': code} or an action dict in pixels. Raises ValueError if neither."""
+    """Gemma's reply -> {'controller': code}, an action dict in pixels or {'keep': True}. Raises ValueError if none."""
     code = re.search(r'```python\n(.*?)(```|$)', reply, re.S)
     if code:
         return {'controller': code.group(1)}
     start = reply.find('{')
     if start < 0:
-        raise ValueError('reply had neither a JSON action nor a python block')
+        if re.search(r'\bKEEP\b', reply):
+            return {'keep': True}
+        raise ValueError('reply had no JSON action, python block or KEEP')
     choice = json.JSONDecoder().raw_decode(reply[start:])[0]
     return {'tool': choice['tool'], 'params': to_pixels(choice.get('params', {}), width, height)}
 
@@ -82,6 +92,7 @@ class Agent(AutoPilot):
     def think(self, obs, event, memory):
         info = obs.info
         log = memory.setdefault('log', [])
+        scores = memory.setdefault('scores', [])
         frame = Image.open(io.BytesIO(obs.image)).convert('RGB')
         frame.thumbnail((768, 768))
         jpeg = io.BytesIO()
@@ -92,7 +103,11 @@ class Agent(AutoPilot):
             f"Screen: {info['width']}x{info['height']} pixels. Time left: {info['remaining_s']:.0f} s.\n"
             f"What just happened: {event}.\n"
             f"Result of the last action: {obs.last_action}\n"
-            f"Your recent replies, oldest first:\n" + ('\n'.join(log[-6:]) or 'none') + '\nYour reply:'
+            f"Scores you read so far (game time: score): "
+            + (', '.join(f'{t:.0f} s: {s}' for t, s in scores[-10:]) or 'none') + '\n'
+            + (f"Your controller is playing now, for {obs.elapsed_s - self.controller_start:.0f} s. Its code:\n"
+               f"```python\n{self.controller_code}```\n" if self.controller else '')
+            + "Your recent replies, oldest first:\n" + ('\n'.join(log[-6:]) or 'none') + '\nYour reply:'
         )
         messages = [
             {'role': 'system', 'content': RULES},
@@ -101,5 +116,8 @@ class Agent(AutoPilot):
         began = time.time()
         reply, tokens = chat(messages, 768)
         log.append(f'[{event}] ' + ' '.join(reply.split())[:300])
+        score = re.search(r'^\s*Score:\s*(.+)$', reply, re.M)
+        if score:
+            scores.append((obs.elapsed_s, score.group(1).strip()[:20]))
         self.replies.append((obs.elapsed_s, event, reply, time.time() - began, tokens))
         return parse(reply, info['width'], info['height'])

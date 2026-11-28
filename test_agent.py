@@ -135,3 +135,17 @@ user = FakeServer.body['messages'][1]['content']
 assert user[0]['image_url']['url'].startswith('data:image/jpeg;base64,') and 'ready' in user[1]['text'], user
 assert agent.replies[-1][4] == 20
 print('vllm request ok')
+
+# 8. Check-ins: a running controller wakes the model every CHECK_S, plays on meanwhile, and KEEP keeps it.
+import autopilot  # noqa: E402
+autopilot.CHECK_S = 1
+agent = FakeModel([{'controller': 'def control(frame, mem): return {"tool": "hold_keys", "params": {"keys": ["", "a"], "duration_ms": 200}}'},
+                   {'keep': True}])
+actions = play(agent, 2.6)
+assert any(e.startswith('check-in: your controller has played for') for e in agent.seen), agent.seen
+assert agent.controller is not None and agent.controller_code.startswith('def control'), agent.seen
+held = [a for a in actions if a.tool == 'hold_keys']
+assert len(held) >= 10 and all(a.params['keys'] == ['a'] for a in held), actions   # played on, empty key dropped
+autopilot.CHECK_S = 10
+assert gemma.parse('Score: 40\nKEEP', 1, 1) == {'keep': True}
+print('check-in ok')

@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 from gga.protocol import Action
 
-TIMEOUT_S = 120            # wake the model if a controller ran this long without it
+CHECK_S = 10               # while a controller plays, the model looks at it this often
 CONTROLLER_MAX_S = 0.1     # a controller call slower than this is switched off
 SCENE_DIFF = 0.5           # share of pixels that must differ from ~1 s ago for a scene change
 SCENE_COOLDOWN_S = 2
@@ -28,7 +28,8 @@ class Agent:
         self._reset()
 
     def think(self, obs, event, memory):
-        """Override with the model. Returns {"tool": ..., "params": {...}} or {"controller": "<code>"}.
+        """Override with the model. Returns {"tool": ..., "params": {...}}, {"controller": "<code>"},
+        or {"keep": True} to let the running controller play on.
 
         Controller code defines control(frame, mem) -> action dict, or None to hand control back.
         frame is the screen as an RGB numpy array (pixels = action coordinates), mem a dict it keeps.
@@ -40,6 +41,7 @@ class Agent:
         self.future = None   # shortcut: a think still running from the last game delays this game's first one
         self.memory = {}     # per game, for the model's notes
         self.controller = None
+        self.controller_code = None   # its source, for the model's check-ins
         self.wake = 'new game'
         self.scenes = deque()
         self.scene_t = -SCENE_COOLDOWN_S
@@ -77,10 +79,13 @@ class Agent:
         self.wake = self.wake or event
 
     def _apply(self, decision, t, frame):
+        if decision.get('keep'):
+            return None   # the running controller plays on
         if 'controller' in decision:
             namespace = {'np': np}
             exec(decision['controller'], namespace)   # trusted: only our own model writes this code
-            self.controller, self.controller_mem, self.controller_t = namespace['control'], {}, t
+            self.controller, self.controller_mem = namespace['control'], {}
+            self.controller_code, self.controller_start, self.controller_t = decision['controller'], t, t
             return self._run_controller(t, frame)
         self.controller = None
         return Action(decision['tool'], decision.get('params', {}))
@@ -90,9 +95,10 @@ class Agent:
         try:
             # shortcut: an endless loop in control() hangs step(); move it to a subprocess if models write those
             choice = self.controller(frame, self.controller_mem)
-            if choice is not None:   # numpy numbers -> plain numbers, coordinates -> ints, as the game requires
+            if choice is not None:   # numpy -> plain numbers, coordinates -> ints, no empty keys: as the game requires
                 choice = json.loads(json.dumps(choice, default=lambda o: o.item()), object_hook=lambda d: {
-                    k: round(v) if k in XY and isinstance(v, float) else v for k, v in d.items()})
+                    k: round(v) if k in XY and isinstance(v, float) else [x for x in v if x != ''] if k == 'keys'
+                    and isinstance(v, list) else v for k, v in d.items()})
         except Exception as e:
             self.controller = None
             self._wake(t, f'controller crashed: {e!r}')
@@ -104,9 +110,10 @@ class Agent:
             self.controller = None
             self._wake(t, self.controller_mem.get('handoff', 'controller handed control back'))
             return None
-        elif t - self.controller_t > TIMEOUT_S:
-            self.controller_t = t
-            self._wake(t, 'controller still running after 120 s')   # it keeps playing while the model looks
+        elif t - self.controller_t >= CHECK_S:
+            self.controller_t = t   # it keeps playing while the model looks
+            self._wake(t, f'check-in: your controller has played for {t - self.controller_start:.0f} s and plays on '
+                          'while you look. Is the score rising? KEEP it, or reply with a better controller or an action')
         return Action(choice['tool'], choice.get('params', {}))
 
     def _check_scene(self, t, frame):

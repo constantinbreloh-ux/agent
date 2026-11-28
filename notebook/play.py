@@ -5,7 +5,7 @@ from IPython.display import HTML, Image as Frame, display
 from gga.game import Game
 
 GAME = 'asteroid_capitalist'   # asteroid_capitalist, blarglike, cavebots or off_line
-PLAY_SECONDS = 60              # in the competition a game runs for 10 minutes
+PLAY_SECONDS = 120             # in the competition a game runs for 10 minutes
 AGENT_VIEW = False             # False: the live game, every frame; True: only the screenshots the agent sees
 
 # The competition's run skips this: the server in the last cell must be up within 15 minutes.
